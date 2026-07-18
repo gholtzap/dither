@@ -1,0 +1,16 @@
+{
+  "name": "dither-web",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "dither_web_bg.wasm",
+    "dither_web.js",
+    "dither_web.d.ts"
+  ],
+  "main": "dither_web.js",
+  "types": "dither_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

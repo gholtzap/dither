@@ -9,6 +9,22 @@ use serde::{Deserialize, Serialize};
 /// Linear-light, unassociated RGBA. RGB may be HDR; alpha is always in 0...1.
 pub type Pixel = [f32; 4];
 
+pub fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceInfo {
     pub path: PathBuf,
@@ -2256,6 +2272,14 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn srgb_transfer_functions_round_trip_display_values() {
+        for encoded in [0.0, 0.02, 0.18, 0.5, 1.0] {
+            let round_trip = linear_to_srgb(srgb_to_linear(encoded));
+            assert!((round_trip - encoded).abs() < 1.0e-6);
+        }
     }
 
     #[test]

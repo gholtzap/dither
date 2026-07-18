@@ -8,7 +8,10 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
-use dither_core::{Document, Metadata, Pixel, RenderedImage, SourceImage, SourceInfo};
+use dither_core::{
+    Document, Metadata, Pixel, RenderedImage, SourceImage, SourceInfo, linear_to_srgb,
+    srgb_to_linear,
+};
 use exr::{
     meta::attribute::AttributeValue,
     prelude::{
@@ -1012,22 +1015,6 @@ fn u16_bytes(pixels: &[[u16; 4]], bytes: fn(u16) -> [u8; 2]) -> Vec<u8> {
 
 fn quantize(value: f32) -> u16 {
     (value.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16
-}
-
-fn srgb_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(value: f32) -> f32 {
-    if value <= 0.0031308 {
-        value * 12.92
-    } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    }
 }
 
 fn same_path(left: &Path, right: &Path) -> Result<bool, std::io::Error> {

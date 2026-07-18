@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Dither browser integration test</title>
+  </head>
+  <body>
+    <p id="status">processing</p>
+    <script type="module">
+      import "../src/auto.js";
+
+      const source = document.createElement("canvas");
+      source.width = 128;
+      source.height = 128;
+      const context = source.getContext("2d");
+      const gradient = context.createLinearGradient(0, 0, 128, 128);
+      gradient.addColorStop(0, "#111827");
+      gradient.addColorStop(0.5, "#ef4444");
+      gradient.addColorStop(1, "#fef3c7");
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, 128, 128);
+
+      const image = new Image();
+      image.alt = "Dither browser integration result";
+      image.width = 128;
+      image.height = 128;
+      image.src = source.toDataURL("image/png");
+      image.setAttribute("dither", "bayer2x2,brightness=0.1,grain=0");
+      image.addEventListener("ditherload", () => {
+        document.querySelector("#status").textContent = "ready";
+      });
+      image.addEventListener("dithererror", ({ detail }) => {
+        document.querySelector("#status").textContent = `error: ${detail.error}`;
+      });
+      document.body.append(image);
+    </script>
+  </body>
+</html>

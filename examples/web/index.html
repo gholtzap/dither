@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Dither / Web Lab</title>
+    <style>
+      @font-face { font-family: Plex; src: url("../../crates/dither-desktop/assets/fonts/IBMPlexSansCondensed-Regular.ttf"); }
+      @font-face { font-family: Mono; src: url("../../crates/dither-desktop/assets/fonts/IBMPlexMono-Regular.ttf"); }
+      :root { color-scheme: dark; --ink:#0d0d0b; --panel:#171714; --line:#3a3932; --paper:#eee9d8; --muted:#9c998d; --signal:#f0442f; }
+      * { box-sizing: border-box; }
+      body { margin:0; min-width:320px; background:var(--ink); color:var(--paper); font-family:Plex,sans-serif; }
+      header { display:flex; align-items:baseline; justify-content:space-between; padding:18px 24px; border-bottom:1px solid var(--line); }
+      h1 { margin:0; font-size:clamp(24px,4vw,44px); font-weight:400; letter-spacing:-.04em; text-transform:uppercase; }
+      header span, code, output, #status, a { font-family:Mono,monospace; }
+      header span, #status { color:var(--signal); font-size:11px; text-transform:uppercase; }
+      main { display:grid; grid-template-columns:390px minmax(0,1fr); min-height:calc(100vh - 82px); }
+      form { height:calc(100vh - 82px); overflow:auto; border-right:1px solid var(--line); background:var(--panel); }
+      details { border-bottom:1px solid var(--line); }
+      summary { cursor:pointer; padding:14px 20px; color:var(--muted); font:12px Mono,monospace; letter-spacing:.1em; text-transform:uppercase; }
+      .controls { padding:4px 20px 18px; }
+      label.control { display:grid; grid-template-columns:1fr minmax(110px,1.2fr) 42px; gap:8px; align-items:center; min-height:34px; }
+      label.control > span { font-size:14px; }
+      label.control output { color:var(--signal); font-size:10px; text-align:right; }
+      label.control.checkbox { grid-template-columns:1fr auto; }
+      label.control.file { display:block; margin:0 0 12px; }
+      label.control.file input { margin-top:6px; }
+      input, select, button, textarea, a.download { border:1px solid var(--line); border-radius:0; background:var(--ink); color:var(--paper); font:12px Plex,sans-serif; }
+      input[type="range"] { width:100%; accent-color:var(--signal); }
+      input[type="checkbox"] { accent-color:var(--signal); }
+      input[type="number"], select { width:100%; height:30px; padding:0 7px; }
+      input[type="color"] { width:100%; height:28px; padding:2px; }
+      input[type="file"] { width:100%; padding:7px; }
+      button, a.download { display:inline-flex; align-items:center; justify-content:center; min-height:34px; padding:0 10px; cursor:pointer; text-decoration:none; text-transform:uppercase; }
+      button:hover, a.download:hover { background:var(--paper); color:var(--ink); }
+      .button-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }
+      .plate-editor { margin:8px 0; border:1px solid var(--line); }
+      .plate-editor summary { padding:9px 12px; }
+      .plate-editor .controls { padding:8px 12px 12px; }
+      .stage { min-width:0; padding:24px; overflow:auto; }
+      .readout { display:flex; gap:12px; align-items:center; margin-bottom:14px; }
+      code { color:var(--muted); font-size:10px; overflow-wrap:anywhere; }
+      .images { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); }
+      figure { position:relative; margin:0; min-width:0; background:#090908; }
+      figcaption { position:absolute; z-index:1; top:10px; left:10px; padding:4px 6px; background:#0d0d0bd9; font-size:10px; letter-spacing:.1em; text-transform:uppercase; }
+      img { display:block; width:100%; height:min(58vh,640px); object-fit:contain; }
+      img[aria-busy="true"] { opacity:.55; }
+      .output-actions { display:flex; gap:8px; margin:14px 0; }
+      #plates { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:1px; background:var(--line); }
+      #plates figure { border:1px solid var(--line); }
+      #plates img { height:180px; }
+      #plates a { position:absolute; right:8px; bottom:8px; color:var(--paper); font-size:9px; }
+      .empty { color:var(--muted); font:11px Mono,monospace; }
+      @media (max-width:850px) { main { grid-template-columns:1fr; } form { height:auto; border-right:0; } .images { grid-template-columns:1fr; } img { height:auto; max-height:70vh; } }
+    </style>
+  </head>
+  <body>
+    <header><h1>Dither / Web Lab</h1><span>Rust → WASM → Worker</span></header>
+    <main>
+      <form id="controls">
+        <details open>
+          <summary>Source & assets</summary>
+          <div class="controls">
+            <label class="control file"><span>Source image</span><input id="sourceFile" type="file" accept="image/*" /></label>
+            <label class="control file"><span>Paper texture</span><input id="paperTexture" type="file" accept="image/*" /></label>
+            <label class="control file"><span>Displacement map</span><input id="displacementMap" type="file" accept="image/*" /></label>
+            <label class="control file"><span>Distress mask</span><input id="distressMask" type="file" accept="image/*" /></label>
+          </div>
+        </details>
+        <details open><summary>Recipes</summary><div class="controls" id="recipeControls"></div></details>
+        <details open><summary>Dither</summary><div class="controls" id="ditherControls"></div></details>
+        <details><summary>Pre-dither</summary><div class="controls" id="preprocessControls"></div></details>
+        <details open><summary>Color & plates</summary><div class="controls" id="separationControls"><div id="separationBase"></div><div id="plateEditors"></div></div></details>
+        <details><summary>Print</summary><div class="controls" id="printControls"></div></details>
+        <details><summary>Highlight glow</summary><div class="controls" id="glowControls"></div></details>
+        <details><summary>Displacement</summary><div class="controls" id="displacementControls"></div></details>
+        <details><summary>CRT phaser</summary><div class="controls" id="crtControls"></div></details>
+        <details><summary>Surface</summary><div class="controls" id="surfaceControls"></div></details>
+        <details><summary>Output</summary><div class="controls" id="outputControls"></div></details>
+      </form>
+      <section class="stage" aria-label="Image comparison">
+        <div class="readout"><span id="status" role="status" aria-live="polite">Processing</span><code id="spec"></code></div>
+        <div class="images">
+          <figure><figcaption>Original</figcaption><img id="original" alt="Original test image" /></figure>
+          <figure><figcaption>Composite</figcaption><img id="effect" alt="Dithered composite" /></figure>
+        </div>
+        <div class="output-actions"><a class="download" id="downloadComposite" download="dither-composite.png">Composite</a></div>
+        <div id="plates"><p class="empty">Plate output appears here.</p></div>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

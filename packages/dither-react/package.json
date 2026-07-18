@@ -1,0 +1,54 @@
+{
+  "name": "@gavinholtzapple/dither",
+  "version": "0.1.0",
+  "description": "Dither images in browsers and React with the Dither Rust engine",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gholtzap/dither.git",
+    "directory": "packages/dither-react"
+  },
+  "homepage": "https://github.com/gholtzap/dither#web",
+  "bugs": "https://github.com/gholtzap/dither/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": [
+    "./src/auto.js"
+  ],
+  "files": [
+    "src",
+    "wasm",
+    "USAGE.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/core.d.ts",
+      "import": "./src/core.js"
+    },
+    "./react": {
+      "types": "./src/react.d.ts",
+      "import": "./src/react.js"
+    },
+    "./auto": {
+      "types": "./src/auto.d.ts",
+      "import": "./src/auto.js"
+    }
+  },
+  "scripts": {
+    "build": "wasm-pack build ../../crates/dither-web --target web --release --out-dir ../../packages/dither-react/wasm --out-name dither_web",
+    "sample": "python3 -m http.server 4173 --directory ../..",
+    "test": "node --test",
+    "typecheck": "tsc",
+    "prepublishOnly": "npm test && npm run typecheck"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "typescript": "^5.8.0"
+  }
+}
