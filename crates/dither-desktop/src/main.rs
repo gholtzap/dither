@@ -25,6 +25,11 @@ use eframe::egui::{
     TextureHandle, Vec2,
 };
 use rfd::FileDialog;
+#[cfg(target_os = "macos")]
+use muda::{
+    Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    accelerator::{Accelerator, Code, Modifiers},
+};
 use workspace::{
     BrowserSort, ExportRecord, ExportSettings, PersistentState, ProjectFile, SavedExportFormat,
 };
@@ -38,6 +43,88 @@ const BORDER: Color32 = Color32::from_rgb(52, 52, 45);
 const PAPER: Color32 = Color32::from_rgb(238, 229, 205);
 const MUTED: Color32 = Color32::from_rgb(155, 150, 138);
 const ACCENT: Color32 = Color32::from_rgb(197, 53, 40);
+
+#[cfg(target_os = "macos")]
+fn install_native_menu() -> muda::Result<Menu> {
+    let command = Some(Modifiers::SUPER);
+    let item = |id: &str, text: &str, key: Option<Code>| {
+        MenuItem::with_id(
+            id,
+            text,
+            true,
+            key.map(|key| Accelerator::new(command, key)),
+        )
+    };
+    let app = Submenu::with_items(
+        "Dither",
+        true,
+        &[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::services(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ],
+    )?;
+    let file = Submenu::with_items(
+        "File",
+        true,
+        &[
+            &item("open", "Open…", Some(Code::KeyO)),
+            &item("open-new-tab", "Open in New Tab…", None),
+            &PredefinedMenuItem::separator(),
+            &item("open-project", "Open Project…", None),
+            &item("save-project", "Save Project As…", Some(Code::KeyS)),
+            &PredefinedMenuItem::separator(),
+            &item("reload-source", "Reload Source", None),
+            &item("relink-source", "Relink Source…", None),
+            &PredefinedMenuItem::separator(),
+            &item("export", "Export…", Some(Code::KeyE)),
+        ],
+    )?;
+    let edit = Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &item("undo", "Undo", Some(Code::KeyZ)),
+            &MenuItem::with_id(
+                "redo",
+                "Redo",
+                true,
+                Some(Accelerator::new(
+                    Some(Modifiers::SUPER | Modifiers::SHIFT),
+                    Code::KeyZ,
+                )),
+            ),
+            &PredefinedMenuItem::separator(),
+            &item("duplicate-tab", "Duplicate Tab", None),
+            &item("close-tab", "Close Tab", Some(Code::KeyW)),
+        ],
+    )?;
+    let view = Submenu::with_items(
+        "View",
+        true,
+        &[&item("toggle-files", "Toggle Files", None)],
+    )?;
+    let window = Submenu::with_items(
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::fullscreen(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::bring_all_to_front(None),
+        ],
+    )?;
+    let menu = Menu::with_items(&[&app, &file, &edit, &view, &window])?;
+    menu.init_for_nsapp();
+    window.set_as_windows_menu_for_nsapp();
+    Ok(menu)
+}
 
 #[derive(Clone)]
 struct PlateTexture {
@@ -173,6 +260,8 @@ fn main() -> eframe::Result {
 }
 
 struct Editor {
+    #[cfg(target_os = "macos")]
+    _native_menu: Menu,
     document: Option<Document>,
     preview: Option<TextureHandle>,
     original_preview: Option<TextureHandle>,
@@ -304,6 +393,8 @@ impl Editor {
         let persistent: PersistentState = workspace::load_json(&state_path()).unwrap_or_default();
         let export_settings = persistent.default_export.clone();
         let mut editor = Self {
+            #[cfg(target_os = "macos")]
+            _native_menu: install_native_menu().expect("failed to install macOS menu"),
             document: None,
             preview: None,
             original_preview: None,
@@ -1476,6 +1567,28 @@ impl Editor {
 impl eframe::App for Editor {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        #[cfg(target_os = "macos")]
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            match event.id.as_ref() {
+                "open" => self.open(&context),
+                "open-new-tab" => {
+                    self.open_in_new_tab = true;
+                    self.open(&context);
+                    self.open_in_new_tab = false;
+                }
+                "open-project" => self.open_project(&context),
+                "save-project" => self.save_project_as(),
+                "reload-source" => self.reload_source(&context),
+                "relink-source" => self.relink_source(&context),
+                "export" => self.inspector_tab = InspectorTab::Output,
+                "undo" => self.undo(&context),
+                "redo" => self.redo(&context),
+                "duplicate-tab" => self.duplicate_active_tab(),
+                "close-tab" => self.close_active_tab(),
+                "toggle-files" => self.library_open = !self.library_open,
+                _ => {}
+            }
+        }
         self.process_jobs(&context);
         if let Some(path) = context.input(|input| {
             input
@@ -1559,11 +1672,12 @@ impl eframe::App for Editor {
                 .exact_size(32.0)
                 .frame(egui::Frame::new().fill(Color32::from_rgb(20, 20, 18)))
                 .show(ui, |ui| {
+                    ui.spacing_mut().button_padding.y = 5.0;
                     egui::ScrollArea::horizontal()
                         .id_salt("document-tabs-scroll")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
-                            ui.horizontal_centered(|ui| {
+                            ui.horizontal(|ui| {
                                 for (index, label) in self.tab_labels.iter().enumerate() {
                                     let selected = index == self.active_tab;
                                     egui::Frame::new()
@@ -1775,114 +1889,6 @@ impl eframe::App for Editor {
                 }
             }
         }
-        egui::Panel::top("header")
-            .exact_size(48.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(18, 18, 16))
-                    .inner_margin(8.0)
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if ui
-                        .selectable_label(self.library_open, "Files")
-                        .on_hover_text("Show or hide the image library")
-                        .clicked()
-                    {
-                        self.library_open = !self.library_open;
-                    }
-                    ui.label(
-                        RichText::new("DITHER / COPY LAB")
-                            .size(18.0)
-                            .family(FontFamily::Name(Arc::from("plex-heading")))
-                            .color(PAPER),
-                    );
-                    ui.add_space(10.0);
-                    if ui
-                        .add_enabled(!self.opening, egui::Button::new("Open"))
-                        .clicked()
-                    {
-                        self.open(&context);
-                    }
-                    ui.menu_button("Project", |ui| {
-                        if ui.button("Open project…").clicked() {
-                            self.open_project(&context);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.document.is_some(),
-                                egui::Button::new("Save project…"),
-                            )
-                            .clicked()
-                        {
-                            self.save_project_as();
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                self.document.is_some(),
-                                egui::Button::new("Reload source"),
-                            )
-                            .clicked()
-                        {
-                            self.reload_source(&context);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.document.is_some(),
-                                egui::Button::new("Relink source…"),
-                            )
-                            .clicked()
-                        {
-                            self.relink_source(&context);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.document.is_some(),
-                                egui::Button::new("Duplicate tab"),
-                            )
-                            .clicked()
-                        {
-                            self.duplicate_active_tab();
-                            ui.close();
-                        }
-                    });
-                    if ui
-                        .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
-                        .clicked()
-                    {
-                        self.undo(&context);
-                    }
-                    if ui
-                        .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        self.redo(&context);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                self.document.is_some(),
-                                egui::Button::new(if self.exporting {
-                                    "Exporting…"
-                                } else {
-                                    "Export"
-                                })
-                                .fill(ACCENT),
-                            )
-                            .clicked()
-                        {
-                            self.inspector_tab = InspectorTab::Output;
-                        }
-                    });
-                });
-            });
-
         egui::Panel::bottom("status")
             .exact_size(24.0)
             .frame(
