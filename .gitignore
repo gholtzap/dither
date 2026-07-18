@@ -9,8 +9,15 @@
 !.env.example
 .idea/
 .vscode/
+node_modules/
+*.tgz
+*.tsbuildinfo
 
 # OS and editor files
 .DS_Store
 *.swp
 *~
+
+CLAUDE.md
+AGENTS.md
+packages/dither-react/*.md
