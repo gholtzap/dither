@@ -20,7 +20,10 @@ use dither_core::{
     ThreeColor, ToneBand, TriTone, built_in_presets,
 };
 use dither_io::{ExportFormat, ExportOptions, IoError};
-use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle, Vec2};
+use eframe::egui::{
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, TextStyle,
+    TextureHandle, Vec2,
+};
 use rfd::FileDialog;
 use workspace::{
     BrowserSort, ExportRecord, ExportSettings, PersistentState, ProjectFile, SavedExportFormat,
@@ -28,10 +31,18 @@ use workspace::{
 
 const PREVIEW_SIZE: NonZeroU32 = NonZeroU32::new(1400).unwrap();
 const THUMBNAIL_SIZE: NonZeroU32 = NonZeroU32::new(128).unwrap();
+const CANVAS: Color32 = Color32::from_rgb(11, 11, 10);
+const PANEL: Color32 = Color32::from_rgb(24, 24, 21);
+const PANEL_RAISED: Color32 = Color32::from_rgb(31, 31, 27);
+const BORDER: Color32 = Color32::from_rgb(52, 52, 45);
+const PAPER: Color32 = Color32::from_rgb(238, 229, 205);
+const MUTED: Color32 = Color32::from_rgb(155, 150, 138);
+const ACCENT: Color32 = Color32::from_rgb(197, 53, 40);
 
 #[derive(Clone)]
 struct PlateTexture {
     name: String,
+    color: Color32,
     grayscale: TextureHandle,
     inked: TextureHandle,
 }
@@ -42,6 +53,14 @@ enum PlateView {
     Composite,
     Grayscale(usize),
     Inked(usize),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum InspectorTab {
+    #[default]
+    Adjust,
+    Plates,
+    Output,
 }
 
 struct BrowserEntry {
@@ -102,6 +121,44 @@ struct BatchResult {
     error: Option<String>,
 }
 
+fn configure_fonts(context: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "plex-sans-condensed".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/IBMPlexSansCondensed-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "plex-sans-condensed-semibold".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/IBMPlexSansCondensed-SemiBold.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "plex-mono".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/IBMPlexMono-Regular.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .get_mut(&FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "plex-sans-condensed".into());
+    fonts
+        .families
+        .get_mut(&FontFamily::Monospace)
+        .unwrap()
+        .insert(0, "plex-mono".into());
+    let mut heading_fonts = vec!["plex-sans-condensed-semibold".into()];
+    heading_fonts.extend(fonts.families[&FontFamily::Proportional].clone());
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from("plex-heading")), heading_fonts);
+    context.set_fonts(fonts);
+}
+
 fn main() -> eframe::Result {
     eframe::run_native(
         "Dither",
@@ -133,9 +190,10 @@ struct Editor {
     exporting: bool,
     export_progress: Arc<AtomicU8>,
     export_cancel: Arc<AtomicBool>,
-    export_plates: bool,
     export_settings: ExportSettings,
     export_history_open: bool,
+    inspector_tab: InspectorTab,
+    library_open: bool,
     recipe: Recipe,
     undo: Vec<Recipe>,
     redo: Vec<Recipe>,
@@ -201,14 +259,42 @@ struct PendingExport {
 impl Editor {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
         context.egui_ctx.set_theme(egui::Theme::Dark);
+        configure_fonts(&context.egui_ctx);
         let mut style = (*context.egui_ctx.style_of(egui::Theme::Dark)).clone();
         style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = Color32::from_rgb(24, 24, 21);
-        style.visuals.window_fill = Color32::from_rgb(31, 31, 27);
+        style.visuals.override_text_color = Some(PAPER);
+        style.visuals.weak_text_color = Some(MUTED);
+        style.visuals.panel_fill = PANEL;
+        style.visuals.window_fill = PANEL_RAISED;
+        style.visuals.extreme_bg_color = CANVAS;
+        style.visuals.faint_bg_color = Color32::from_rgb(35, 35, 30);
         style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 42, 37);
+        style.visuals.widgets.inactive.fg_stroke.color = PAPER;
         style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(57, 57, 49);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(197, 53, 40);
-        style.visuals.selection.bg_fill = Color32::from_rgb(197, 53, 40);
+        style.visuals.widgets.hovered.fg_stroke.color = PAPER;
+        style.visuals.widgets.active.bg_fill = ACCENT;
+        style.visuals.selection.bg_fill = ACCENT;
+        style.visuals.selection.stroke.color = PAPER;
+        style.animation_time = 0.14;
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(21.0, FontFamily::Name(Arc::from("plex-heading"))),
+        );
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(12.0, FontFamily::Monospace),
+        );
         style.spacing.item_spacing = Vec2::new(8.0, 9.0);
         style.spacing.button_padding = Vec2::new(12.0, 7.0);
         context.egui_ctx.set_style_of(egui::Theme::Dark, style);
@@ -235,9 +321,10 @@ impl Editor {
             exporting: false,
             export_progress: Arc::new(AtomicU8::new(0)),
             export_cancel: Arc::new(AtomicBool::new(false)),
-            export_plates: false,
             export_settings,
             export_history_open: false,
+            inspector_tab: InspectorTab::Adjust,
+            library_open: false,
             recipe,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -451,6 +538,7 @@ impl Editor {
                             .iter()
                             .map(|plate| PlateTexture {
                                 name: plate.name.clone(),
+                                color: rgb_color(plate.ink.color),
                                 grayscale: context.load_texture(
                                     format!("plate-{}-gray", plate.name),
                                     plate_image(
@@ -567,42 +655,19 @@ impl Editor {
         }
     }
 
-    fn choose_export(&mut self) {
-        let Some(document) = &self.document else {
+    fn run_configured_export(&mut self) {
+        let Some(destination) = self.document.as_ref().and_then(|document| {
+            self.export_settings
+                .destination(&document.source().info.path)
+        }) else {
             return;
         };
-        let default_name = document
-            .source()
-            .info
-            .path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}-dithered.tif"))
-            .unwrap_or_else(|| "dithered.tif".into());
-        let Some(mut path) = FileDialog::new()
-            .set_title("Export full-resolution image")
-            .set_file_name(default_name)
-            .add_filter("TIFF — 16-bit lossless", &["tif", "tiff"])
-            .add_filter("PNG — 16-bit lossless", &["png"])
-            .add_filter("OpenEXR — 32-bit float lossless", &["exr"])
-            .save_file()
-        else {
-            return;
-        };
-        if path.extension().is_none() {
-            path.set_extension("tif");
-        }
-        let format = match path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("png") => ExportFormat::Png16,
-            Some("exr") => ExportFormat::OpenExr32,
-            _ => ExportFormat::Tiff16,
-        };
-        self.run_export(path, format, ExportOptions::default(), self.export_plates);
+        self.run_export(
+            destination,
+            self.export_settings.format.into(),
+            ExportOptions::default(),
+            self.export_settings.plates,
+        );
     }
 
     fn run_export(
@@ -716,7 +781,6 @@ impl Editor {
         self.plate_view = tab.plate_view;
         self.project_path = tab.project_path;
         self.export_settings = tab.export;
-        self.export_plates = self.export_settings.plates;
         self.dirty = tab.dirty;
         self.source_modified = self
             .document
@@ -836,6 +900,7 @@ impl Editor {
     }
 
     fn load_folder(&mut self, folder: PathBuf, context: &egui::Context) {
+        self.library_open = true;
         let mut entries = scan_folder(&folder, self.persistent.browser_sort);
         self.browser.generation = self.browser.generation.wrapping_add(1);
         let generation = self.browser.generation;
@@ -1102,17 +1167,20 @@ impl Editor {
             0.0..=1.0,
         );
         changed |= variation(ui, "Blue-noise seed", &mut document.recipe.dither.seed);
-        egui::ComboBox::from_label("Recipe preset")
-            .selected_text("Choose preset…")
-            .show_ui(ui, |ui| {
-                for (name, recipe) in built_in_presets() {
-                    if ui.selectable_label(false, *name).clicked() {
-                        document.recipe = recipe.clone();
-                        let _ = load_recipe_assets(document);
-                        changed = true;
+        control_row(ui, "Preset", |ui| {
+            egui::ComboBox::from_id_salt("recipe-preset")
+                .width(ui.available_width())
+                .selected_text("Choose preset…")
+                .show_ui(ui, |ui| {
+                    for (name, recipe) in built_in_presets() {
+                        if ui.selectable_label(false, *name).clicked() {
+                            document.recipe = recipe.clone();
+                            let _ = load_recipe_assets(document);
+                            changed = true;
+                        }
                     }
-                }
-            });
+                });
+        });
 
         ui.add_space(18.0);
         ui.label(section_label("PRE-DITHER"));
@@ -1225,17 +1293,20 @@ impl Editor {
         ui.label(section_label("PRINT"));
         changed |= slider(ui, "DPI", &mut document.recipe.print.dpi, 36.0..=2400.0);
         changed |= slider(ui, "LPI", &mut document.recipe.print.lpi, 5.0..=300.0);
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut document.recipe.print.bleed_pixels, 0..=16).text("Bleed px"),
+        changed |= control_row(ui, "Bleed px", |ui| {
+            ui.add_sized(
+                [ui.available_width(), 18.0],
+                egui::Slider::new(&mut document.recipe.print.bleed_pixels, 0..=16),
             )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut document.recipe.print.trapping_pixels, 0..=16)
-                    .text("Trapping px"),
+        })
+        .changed();
+        changed |= control_row(ui, "Trapping px", |ui| {
+            ui.add_sized(
+                [ui.available_width(), 18.0],
+                egui::Slider::new(&mut document.recipe.print.trapping_pixels, 0..=16),
             )
-            .changed();
+        })
+        .changed();
 
         ui.add_space(18.0);
         ui.label(section_label("TRI-TONE TEXTURES / DISPLACE"));
@@ -1325,8 +1396,7 @@ impl Editor {
             &mut document.recipe.glow.saturation,
             0.0..=3.0,
         );
-        ui.horizontal(|ui| {
-            ui.label("Tint");
+        control_row(ui, "Tint", |ui| {
             changed |= ui
                 .color_edit_button_rgb(&mut document.recipe.glow.tint)
                 .changed();
@@ -1394,8 +1464,7 @@ impl Editor {
             0.5..=24.0,
         );
         changed |= variation(ui, "Paper variation", &mut document.recipe.paper.seed);
-        ui.horizontal(|ui| {
-            ui.label("Paper tone");
+        control_row(ui, "Paper tone", |ui| {
             changed |= ui
                 .color_edit_button_rgb(&mut document.recipe.paper_color)
                 .changed();
@@ -1434,7 +1503,7 @@ impl eframe::App for Editor {
                 ))
             })
         {
-            self.choose_export();
+            self.inspector_tab = InspectorTab::Output;
         }
         if self.document.is_some()
             && context.input_mut(|input| {
@@ -1484,71 +1553,110 @@ impl eframe::App for Editor {
 
         if !self.tabs.is_empty() {
             let mut switch_to = None;
-            let mut close_tab = false;
-            let mut duplicate_tab = false;
+            let mut close_tab = None;
+            let mut open_new_tab = false;
             egui::Panel::top("document-tabs")
-                .exact_size(34.0)
+                .exact_size(32.0)
+                .frame(egui::Frame::new().fill(Color32::from_rgb(20, 20, 18)))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for (index, label) in self.tab_labels.iter().enumerate() {
-                            if ui
-                                .selectable_label(index == self.active_tab, label)
-                                .clicked()
-                            {
-                                switch_to = Some(index);
-                            }
-                        }
-                        ui.checkbox(&mut self.open_in_new_tab, "Open in new tab");
-                        if ui.small_button("Duplicate tab").clicked() {
-                            duplicate_tab = true;
-                        }
-                        if ui.small_button("Close tab").clicked() {
-                            close_tab = true;
-                        }
-                    });
+                    egui::ScrollArea::horizontal()
+                        .id_salt("document-tabs-scroll")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                for (index, label) in self.tab_labels.iter().enumerate() {
+                                    let selected = index == self.active_tab;
+                                    egui::Frame::new()
+                                        .fill(if selected {
+                                            Color32::from_rgb(103, 31, 25)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .inner_margin(egui::Margin::symmetric(8, 2))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                if ui.selectable_label(selected, label).clicked() {
+                                                    switch_to = Some(index);
+                                                }
+                                                if ui.small_button("×").clicked() {
+                                                    close_tab = Some(index);
+                                                }
+                                            });
+                                        });
+                                }
+                                if ui
+                                    .small_button("+")
+                                    .on_hover_text("Open in new tab")
+                                    .clicked()
+                                {
+                                    open_new_tab = true;
+                                }
+                            });
+                        });
                 });
             if let Some(index) = switch_to {
                 self.switch_tab(index);
             }
-            if close_tab {
+            if let Some(index) = close_tab {
+                if index != self.active_tab {
+                    self.switch_tab(index);
+                }
                 self.close_active_tab();
             }
-            if duplicate_tab {
-                self.duplicate_active_tab();
+            if open_new_tab {
+                self.open_in_new_tab = true;
+                self.open(&context);
+                self.open_in_new_tab = false;
             }
         }
 
         let mut browser_open = None;
         let mut browser_folder = None;
+        let mut library_open = self.library_open;
         egui::Panel::left("library")
-            .exact_size(230.0)
-            .show(ui, |ui| {
+            .default_size(220.0)
+            .min_size(176.0)
+            .max_size(300.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(12.0)
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show_collapsible(ui, &mut library_open, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(section_label("FILES"));
+                    ui.label(section_label("LIBRARY"));
                     if ui.small_button("Open folder…").clicked() {
                         browser_folder = Some(());
                     }
                 });
-                ui.text_edit_singleline(&mut self.browser.filter);
-                egui::ComboBox::from_label("Sort")
-                    .selected_text(format!("{:?}", self.persistent.browser_sort))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.persistent.browser_sort,
-                            BrowserSort::Name,
-                            "Name",
-                        );
-                        ui.selectable_value(
-                            &mut self.persistent.browser_sort,
-                            BrowserSort::Modified,
-                            "Modified",
-                        );
-                        ui.selectable_value(
-                            &mut self.persistent.browser_sort,
-                            BrowserSort::FileType,
-                            "Type",
-                        );
-                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.browser.filter)
+                        .hint_text("Filter files")
+                        .desired_width(f32::INFINITY),
+                );
+                control_row(ui, "Sort", |ui| {
+                    egui::ComboBox::from_id_salt("browser-sort")
+                        .width(ui.available_width())
+                        .selected_text(format!("{:?}", self.persistent.browser_sort))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.persistent.browser_sort,
+                                BrowserSort::Name,
+                                "Name",
+                            );
+                            ui.selectable_value(
+                                &mut self.persistent.browser_sort,
+                                BrowserSort::Modified,
+                                "Modified",
+                            );
+                            ui.selectable_value(
+                                &mut self.persistent.browser_sort,
+                                BrowserSort::FileType,
+                                "Type",
+                            );
+                        });
+                });
                 ui.checkbox(&mut self.browser.watch, "Watch folder");
                 if ui.small_button("★ Favorite current folder").clicked()
                     && let Some(folder) = self.browser.folder.clone()
@@ -1607,6 +1715,7 @@ impl eframe::App for Editor {
                     }
                 });
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     for entry in self
                         .browser
                         .entries
@@ -1643,6 +1752,7 @@ impl eframe::App for Editor {
                     }
                 });
             });
+        self.library_open = library_open;
         if browser_folder.is_some() {
             self.choose_folder(&context);
         }
@@ -1666,61 +1776,82 @@ impl eframe::App for Editor {
             }
         }
         egui::Panel::top("header")
-            .exact_size(58.0)
+            .exact_size(48.0)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(18, 18, 16))
-                    .inner_margin(12.0),
+                    .inner_margin(8.0)
+                    .stroke(Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
+                    if ui
+                        .selectable_label(self.library_open, "Files")
+                        .on_hover_text("Show or hide the image library")
+                        .clicked()
+                    {
+                        self.library_open = !self.library_open;
+                    }
                     ui.label(
                         RichText::new("DITHER / COPY LAB")
-                            .strong()
                             .size(18.0)
-                            .color(Color32::from_rgb(238, 229, 205)),
+                            .family(FontFamily::Name(Arc::from("plex-heading")))
+                            .color(PAPER),
                     );
-                    ui.add_space(18.0);
+                    ui.add_space(10.0);
                     if ui
-                        .add_enabled(!self.opening, egui::Button::new("Open original"))
+                        .add_enabled(!self.opening, egui::Button::new("Open"))
                         .clicked()
                     {
                         self.open(&context);
                     }
-                    if ui.button("Open project").clicked() {
-                        self.open_project(&context);
-                    }
-                    if ui
-                        .add_enabled(self.document.is_some(), egui::Button::new("Save project"))
-                        .clicked()
-                    {
-                        self.save_project_as();
-                    }
-                    if ui
-                        .add_enabled(self.document.is_some(), egui::Button::new("Reload source"))
-                        .clicked()
-                    {
-                        self.reload_source(&context);
-                    }
-                    if ui
-                        .add_enabled(self.document.is_some(), egui::Button::new("Relink"))
-                        .clicked()
-                    {
-                        self.relink_source(&context);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.document.is_some() && !self.exporting,
-                            egui::Button::new(if self.exporting {
-                                "Exporting…"
-                            } else {
-                                "Export"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.choose_export();
-                    }
+                    ui.menu_button("Project", |ui| {
+                        if ui.button("Open project…").clicked() {
+                            self.open_project(&context);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.document.is_some(),
+                                egui::Button::new("Save project…"),
+                            )
+                            .clicked()
+                        {
+                            self.save_project_as();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.document.is_some(),
+                                egui::Button::new("Reload source"),
+                            )
+                            .clicked()
+                        {
+                            self.reload_source(&context);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.document.is_some(),
+                                egui::Button::new("Relink source…"),
+                            )
+                            .clicked()
+                        {
+                            self.relink_source(&context);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.document.is_some(),
+                                egui::Button::new("Duplicate tab"),
+                            )
+                            .clicked()
+                        {
+                            self.duplicate_active_tab();
+                            ui.close();
+                        }
+                    });
                     if ui
                         .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
                         .clicked()
@@ -1733,320 +1864,382 @@ impl eframe::App for Editor {
                     {
                         self.redo(&context);
                     }
-                    ui.separator();
-                    ui.label(
-                        RichText::new(&self.status)
-                            .small()
-                            .color(Color32::from_gray(165)),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                self.document.is_some(),
+                                egui::Button::new(if self.exporting {
+                                    "Exporting…"
+                                } else {
+                                    "Export"
+                                })
+                                .fill(ACCENT),
+                            )
+                            .clicked()
+                        {
+                            self.inspector_tab = InspectorTab::Output;
+                        }
+                    });
+                });
+            });
+
+        egui::Panel::bottom("status")
+            .exact_size(24.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(18, 18, 16))
+                    .inner_margin(egui::Margin::symmetric(10, 3))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.status).small().color(MUTED));
+                    if self.dirty {
+                        ui.label(RichText::new("UNSAVED").small().color(ACCENT));
+                    }
                 });
             });
 
         egui::Panel::right("controls")
-            .exact_size(310.0)
+            .default_size(340.0)
+            .min_size(300.0)
+            .max_size(440.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(29, 29, 25))
-                    .inner_margin(18.0)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(52, 52, 45))),
+                    .fill(PANEL_RAISED)
+                    .inner_margin(14.0)
+                    .stroke(Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(section_label("VIEW"));
-                        if ui
-                            .selectable_label(
-                                !self.show_original && !self.show_comparison,
-                                "Effect",
-                            )
-                            .clicked()
-                        {
-                            self.show_original = false;
-                            self.show_comparison = false;
-                        }
-                        if ui
-                            .selectable_label(self.show_original, "Original")
-                            .clicked()
-                        {
-                            self.show_original = true;
-                            self.show_comparison = false;
-                        }
-                        if self.comparison.is_some()
-                            && ui
-                                .selectable_label(self.show_comparison, "Snapshot")
-                                .clicked()
-                        {
-                            self.show_original = false;
-                            self.show_comparison = true;
-                        }
-                        if ui.small_button("Fit").clicked() {
-                            self.scene_rect = egui::Rect::ZERO;
-                        }
-                    });
-                    ui.label(
-                        RichText::new("Scroll to zoom · drag to pan")
-                            .small()
-                            .color(Color32::from_gray(125)),
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Adjust, "Adjust");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Plates,
+                        format!("Plates  {:02}", self.plate_previews.len()),
                     );
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Snapshot").clicked() {
-                            self.comparison = self.preview.clone();
-                            self.comparison_recipe = self
-                                .document
-                                .as_ref()
-                                .map(|document| document.recipe.clone());
-                            self.show_comparison = false;
-                            self.status = "Snapshot saved; use Snapshot in View to compare".into();
-                        }
-                        if ui.small_button("100%").clicked() {
-                            self.scene_rect =
-                                egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
-                        }
-                    });
-                    egui::CollapsingHeader::new("Plate inspector").show(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.plate_view,
-                            PlateView::Composite,
-                            "Composite",
-                        );
-                        for (index, plate) in self.plate_previews.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(&plate.name);
-                                ui.selectable_value(
-                                    &mut self.plate_view,
-                                    PlateView::Grayscale(index),
-                                    "Mask",
-                                );
-                                ui.selectable_value(
-                                    &mut self.plate_view,
-                                    PlateView::Inked(index),
-                                    "Ink",
-                                );
-                            });
-                        }
-                    });
-                    egui::CollapsingHeader::new("Image information").show(ui, |ui| {
-                        if let Some(document) = &self.document {
-                            let source = document.source();
-                            ui.label(format!("{} × {} pixels", source.width(), source.height()));
-                            ui.label(format!(
-                                "{}-bit {}",
-                                source.info.bit_depth, source.info.format
-                            ));
-                            ui.label(format!(
-                                "ICC profile: {} bytes",
-                                source.info.color_profile.len()
-                            ));
-                            ui.label(format!(
-                                "EXIF {} · XMP {} · IPTC {} bytes",
-                                source.info.metadata.exif.len(),
-                                source.info.metadata.xmp.len(),
-                                source.info.metadata.iptc.len()
-                            ));
-                            ui.label(format!(
-                                "Print: {:.2} × {:.2} in at {:.0} DPI",
-                                source.width() as f32 / document.recipe.print.dpi,
-                                source.height() as f32 / document.recipe.print.dpi,
-                                document.recipe.print.dpi
-                            ));
-                            let mut histogram = [0_u32; 32];
-                            for pixel in source
-                                .pixels()
-                                .iter()
-                                .step_by((source.pixels().len() / 100_000).max(1))
-                            {
-                                let value =
-                                    (pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722)
-                                        .clamp(0.0, 1.0);
-                                histogram[(value * 31.0).round() as usize] += 1;
-                            }
-                            let points: Vec<_> = histogram
-                                .iter()
-                                .enumerate()
-                                .map(|(x, y)| {
-                                    egui::Pos2::new(
-                                        x as f32 * 7.0,
-                                        50.0 - *y as f32
-                                            / *histogram.iter().max().unwrap_or(&1) as f32
-                                            * 50.0,
-                                    )
-                                })
-                                .collect();
-                            ui.painter().add(egui::Shape::line(
-                                points,
-                                Stroke::new(1.0, Color32::LIGHT_GRAY),
-                            ));
-                            ui.allocate_space(Vec2::new(220.0, 55.0));
-                        }
-                    });
-                    egui::CollapsingHeader::new("Export manager")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.text_edit_singleline(&mut self.export_settings.naming);
-                            egui::ComboBox::from_label("Format")
-                                .selected_text(format!("{:?}", self.export_settings.format))
-                                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Output, "Output");
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if self.inspector_tab == InspectorTab::Plates {
+                        ui.label(section_label("⊕ PLATE DESK"));
+                        egui::CollapsingHeader::new("Plate inspector").show(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.plate_view,
+                                PlateView::Composite,
+                                "Composite",
+                            );
+                            for (index, plate) in self.plate_previews.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(10.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 1.0, plate.color);
+                                    ui.label(&plate.name);
                                     ui.selectable_value(
-                                        &mut self.export_settings.format,
-                                        SavedExportFormat::Png16,
-                                        "PNG 16-bit",
+                                        &mut self.plate_view,
+                                        PlateView::Grayscale(index),
+                                        "Mask",
                                     );
                                     ui.selectable_value(
-                                        &mut self.export_settings.format,
-                                        SavedExportFormat::Tiff16,
-                                        "TIFF 16-bit",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.export_settings.format,
-                                        SavedExportFormat::OpenExr32,
-                                        "OpenEXR 32-bit",
+                                        &mut self.plate_view,
+                                        PlateView::Inked(index),
+                                        "Ink",
                                     );
                                 });
-                            ui.checkbox(&mut self.export_settings.plates, "Composite + plates");
-                            if ui.button("Choose output folder…").clicked() {
-                                self.export_settings.directory = FileDialog::new().pick_folder();
                             }
-                            if let Some(document) = &self.document
-                                && let Some(destination) = self
-                                    .export_settings
-                                    .destination(&document.source().info.path)
-                            {
-                                ui.label(format!("Will create: {}", destination.display()));
-                                for plate in &self.plate_previews {
-                                    if self.export_settings.plates {
-                                        ui.label(format!("  + plate {}.png", plate.name));
+                        });
+                        egui::CollapsingHeader::new("Image information").show(ui, |ui| {
+                            if let Some(document) = &self.document {
+                                let source = document.source();
+                                ui.label(format!(
+                                    "{} × {} pixels",
+                                    source.width(),
+                                    source.height()
+                                ));
+                                ui.label(format!(
+                                    "{}-bit {}",
+                                    source.info.bit_depth, source.info.format
+                                ));
+                                ui.label(format!(
+                                    "ICC profile: {} bytes",
+                                    source.info.color_profile.len()
+                                ));
+                                ui.label(format!(
+                                    "EXIF {} · XMP {} · IPTC {} bytes",
+                                    source.info.metadata.exif.len(),
+                                    source.info.metadata.xmp.len(),
+                                    source.info.metadata.iptc.len()
+                                ));
+                                ui.label(format!(
+                                    "Print: {:.2} × {:.2} in at {:.0} DPI",
+                                    source.width() as f32 / document.recipe.print.dpi,
+                                    source.height() as f32 / document.recipe.print.dpi,
+                                    document.recipe.print.dpi
+                                ));
+                                let mut histogram = [0_u32; 32];
+                                for pixel in source
+                                    .pixels()
+                                    .iter()
+                                    .step_by((source.pixels().len() / 100_000).max(1))
+                                {
+                                    let value =
+                                        (pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722)
+                                            .clamp(0.0, 1.0);
+                                    histogram[(value * 31.0).round() as usize] += 1;
+                                }
+                                let points: Vec<_> = histogram
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(x, y)| {
+                                        egui::Pos2::new(
+                                            x as f32 * 7.0,
+                                            50.0 - *y as f32
+                                                / *histogram.iter().max().unwrap_or(&1) as f32
+                                                * 50.0,
+                                        )
+                                    })
+                                    .collect();
+                                ui.painter().add(egui::Shape::line(
+                                    points,
+                                    Stroke::new(1.0, Color32::LIGHT_GRAY),
+                                ));
+                                ui.allocate_space(Vec2::new(220.0, 55.0));
+                            }
+                        });
+                    }
+                    if self.inspector_tab == InspectorTab::Output {
+                        ui.label(section_label("OUTPUT"));
+                        egui::CollapsingHeader::new("Export manager")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                control_row(ui, "Name", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.export_settings.naming,
+                                        )
+                                        .desired_width(ui.available_width()),
+                                    );
+                                });
+                                control_row(ui, "Format", |ui| {
+                                    egui::ComboBox::from_id_salt("export-format")
+                                        .width(ui.available_width())
+                                        .selected_text(format!("{:?}", self.export_settings.format))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.export_settings.format,
+                                                SavedExportFormat::Png16,
+                                                "PNG 16-bit",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.export_settings.format,
+                                                SavedExportFormat::Tiff16,
+                                                "TIFF 16-bit",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.export_settings.format,
+                                                SavedExportFormat::OpenExr32,
+                                                "OpenEXR 32-bit",
+                                            );
+                                        });
+                                });
+                                ui.checkbox(&mut self.export_settings.plates, "Composite + plates");
+                                if ui.button("Choose output folder…").clicked() {
+                                    self.export_settings.directory =
+                                        FileDialog::new().pick_folder();
+                                }
+                                if let Some(document) = &self.document
+                                    && let Some(destination) = self
+                                        .export_settings
+                                        .destination(&document.source().info.path)
+                                {
+                                    ui.label(format!("Will create: {}", destination.display()));
+                                    for plate in &self.plate_previews {
+                                        if self.export_settings.plates {
+                                            ui.label(format!("  + plate {}.png", plate.name));
+                                        }
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.exporting,
+                                            egui::Button::new("Export full-resolution")
+                                                .fill(ACCENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.run_configured_export();
                                     }
                                 }
-                                if ui
-                                    .add_enabled(
-                                        !self.exporting,
-                                        egui::Button::new("Export configured output"),
+                                if self.exporting {
+                                    ui.add(egui::ProgressBar::new(
+                                        self.export_progress.load(Ordering::Relaxed) as f32 / 100.0,
+                                    ));
+                                    if ui.button("Cancel export").clicked() {
+                                        self.export_cancel.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                if ui.button("Export history").clicked() {
+                                    self.export_history_open = !self.export_history_open;
+                                }
+                                if self.export_history_open {
+                                    for record in &self.persistent.export_history {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "{} → {} file(s)",
+                                                record.source.display(),
+                                                record.outputs.len()
+                                            ));
+                                            if ui.small_button("Reveal").clicked()
+                                                && let Some(path) = record.outputs.first()
+                                            {
+                                                reveal_path(path);
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                        egui::CollapsingHeader::new("Batch / watched folder").show(ui, |ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.batch_running,
+                                    egui::Button::new("Export current folder"),
+                                )
+                                .clicked()
+                            {
+                                self.run_batch(&context);
+                            }
+                            for result in &self.batch_results {
+                                ui.label(format!(
+                                    "{} — {}",
+                                    result
+                                        .source
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy(),
+                                    result.error.as_deref().map_or_else(
+                                        || format!("{} file(s)", result.outputs.len()),
+                                        str::to_owned,
                                     )
-                                    .clicked()
-                                {
-                                    self.run_export(
-                                        destination,
-                                        self.export_settings.format.into(),
-                                        ExportOptions::default(),
-                                        self.export_settings.plates,
-                                    );
-                                }
-                            }
-                            if self.exporting {
-                                ui.add(egui::ProgressBar::new(
-                                    self.export_progress.load(Ordering::Relaxed) as f32 / 100.0,
                                 ));
-                                if ui.button("Cancel export").clicked() {
-                                    self.export_cancel.store(true, Ordering::Relaxed);
+                            }
+                        });
+                    }
+                    if self.inspector_tab == InspectorTab::Adjust {
+                        ui.label(section_label("RECIPE"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Save recipe…").clicked()
+                                && let Some(recipe) = self.document.as_ref().map(|d| &d.recipe)
+                            {
+                                match save_recipe_as(recipe) {
+                                    Ok(Some(path)) => {
+                                        self.status = format!("Saved recipe {}", path.display())
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        self.status = format!("Recipe save failed: {error}")
+                                    }
                                 }
                             }
-                            if ui.button("Export history").clicked() {
-                                self.export_history_open = !self.export_history_open;
-                            }
-                            if self.export_history_open {
-                                for record in &self.persistent.export_history {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!(
-                                            "{} → {} file(s)",
-                                            record.source.display(),
-                                            record.outputs.len()
-                                        ));
-                                        if ui.small_button("Reveal").clicked()
-                                            && let Some(path) = record.outputs.first()
-                                        {
-                                            reveal_path(path);
+                            if ui.button("Load recipe…").clicked() {
+                                match load_recipe_as() {
+                                    Ok(Some(recipe)) => {
+                                        if let Some(document) = &mut self.document {
+                                            self.undo.push(document.recipe.clone());
+                                            document.recipe = recipe.clone();
+                                            let errors = load_recipe_assets(document);
+                                            self.status = if errors.is_empty() {
+                                                "Loaded recipe".into()
+                                            } else {
+                                                format!(
+                                                    "Loaded recipe; {} asset(s) unavailable",
+                                                    errors.len()
+                                                )
+                                            };
                                         }
-                                    });
+                                        self.recipe = recipe;
+                                        self.redo.clear();
+                                        self.schedule_preview(&context);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        self.status = format!("Recipe load failed: {error}")
+                                    }
                                 }
                             }
                         });
-                    egui::CollapsingHeader::new("Batch / watched folder").show(ui, |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.batch_running,
-                                egui::Button::new("Export current folder"),
-                            )
-                            .clicked()
-                        {
-                            self.run_batch(&context);
+                        ui.add_space(18.0);
+                        let previous = self
+                            .document
+                            .as_ref()
+                            .map(|document| document.recipe.clone());
+                        let changed = self.controls(ui);
+                        if let (true, Some(previous)) = (changed, previous) {
+                            self.record_edit(previous);
+                            self.schedule_preview(&context);
                         }
-                        for result in &self.batch_results {
-                            ui.label(format!(
-                                "{} — {}",
-                                result
-                                    .source
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy(),
-                                result.error.as_deref().map_or_else(
-                                    || format!("{} file(s)", result.outputs.len()),
-                                    str::to_owned,
-                                )
-                            ));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Save recipe…").clicked()
-                            && let Some(recipe) = self.document.as_ref().map(|d| &d.recipe)
-                        {
-                            match save_recipe_as(recipe) {
-                                Ok(Some(path)) => {
-                                    self.status = format!("Saved recipe {}", path.display())
-                                }
-                                Ok(None) => {}
-                                Err(error) => self.status = format!("Recipe save failed: {error}"),
-                            }
-                        }
-                        if ui.button("Load recipe…").clicked() {
-                            match load_recipe_as() {
-                                Ok(Some(recipe)) => {
-                                    if let Some(document) = &mut self.document {
-                                        self.undo.push(document.recipe.clone());
-                                        document.recipe = recipe.clone();
-                                        let errors = load_recipe_assets(document);
-                                        self.status = if errors.is_empty() {
-                                            "Loaded recipe".into()
-                                        } else {
-                                            format!(
-                                                "Loaded recipe; {} asset(s) unavailable",
-                                                errors.len()
-                                            )
-                                        };
-                                    }
-                                    self.recipe = recipe;
-                                    self.redo.clear();
-                                    self.schedule_preview(&context);
-                                }
-                                Ok(None) => {}
-                                Err(error) => self.status = format!("Recipe load failed: {error}"),
-                            }
-                        }
-                    });
-                    ui.checkbox(
-                        &mut self.export_plates,
-                        "Export composite + grayscale plates",
-                    );
-                    ui.add_space(18.0);
-                    let previous = self
-                        .document
-                        .as_ref()
-                        .map(|document| document.recipe.clone());
-                    let changed = self.controls(ui);
-                    if let (true, Some(previous)) = (changed, previous) {
-                        self.record_edit(previous);
-                        self.schedule_preview(&context);
                     }
                 });
             });
         self.finish_edit(&context);
 
         egui::CentralPanel::default_margins()
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(11, 11, 10))
-                    .inner_margin(28.0),
-            )
+            .frame(egui::Frame::new().fill(CANVAS).inner_margin(28.0))
             .show(ui, |ui| {
+                egui::Frame::new()
+                    .fill(PANEL_RAISED)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(4.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .selectable_label(
+                                    !self.show_original && !self.show_comparison,
+                                    "Effect",
+                                )
+                                .clicked()
+                            {
+                                self.show_original = false;
+                                self.show_comparison = false;
+                            }
+                            if ui
+                                .selectable_label(self.show_original, "Original")
+                                .clicked()
+                            {
+                                self.show_original = true;
+                                self.show_comparison = false;
+                            }
+                            if self.comparison.is_some()
+                                && ui
+                                    .selectable_label(self.show_comparison, "Snapshot")
+                                    .clicked()
+                            {
+                                self.show_original = false;
+                                self.show_comparison = true;
+                            }
+                            ui.separator();
+                            if ui.small_button("Fit").clicked() {
+                                self.scene_rect = egui::Rect::ZERO;
+                            }
+                            if ui.small_button("100%").clicked() {
+                                self.scene_rect =
+                                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
+                            }
+                            if ui.small_button("Capture").clicked() {
+                                self.comparison = self.preview.clone();
+                                self.comparison_recipe = self
+                                    .document
+                                    .as_ref()
+                                    .map(|document| document.recipe.clone());
+                                self.show_comparison = false;
+                                self.status = "Comparison snapshot captured".into();
+                            }
+                        });
+                    });
+                ui.add_space(10.0);
                 let texture = if self.show_comparison {
                     self.comparison.clone().or_else(|| self.preview.clone())
                 } else if self.show_original {
@@ -2086,13 +2279,14 @@ impl eframe::App for Editor {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                RichText::new("A PHOTOCOPY DARKROOM")
+                                RichText::new("⊕  A PHOTOCOPY DARKROOM")
                                     .size(28.0)
-                                    .color(Color32::from_rgb(238, 229, 205)),
+                                    .family(FontFamily::Name(Arc::from("plex-heading")))
+                                    .color(PAPER),
                             );
                             ui.label(
                                 RichText::new("Non-destructive · high bit depth · native export")
-                                    .color(Color32::from_gray(135)),
+                                    .color(MUTED),
                             );
                             ui.add_space(16.0);
                             if ui.button("Choose an original").clicked() {
@@ -2279,64 +2473,67 @@ fn load_recipe_assets(document: &mut Document) -> Vec<String> {
 
 fn algorithm_selector(ui: &mut egui::Ui, algorithm: &mut DitherAlgorithm) -> bool {
     let previous = *algorithm;
-    egui::ComboBox::from_label("Algorithm")
-        .selected_text(algorithm_name(*algorithm))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::Bayer { matrix_size: 2 },
-                "Bayer 2×2",
-            );
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::Bayer { matrix_size: 4 },
-                "Bayer 4×4",
-            );
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::Bayer { matrix_size: 8 },
-                "Bayer 8×8",
-            );
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::FloydSteinberg,
-                "Floyd–Steinberg",
-            );
-            ui.selectable_value(algorithm, DitherAlgorithm::Atkinson, "Atkinson");
-            ui.selectable_value(algorithm, DitherAlgorithm::SierraLite, "Sierra Lite");
-            ui.selectable_value(algorithm, DitherAlgorithm::SierraTwoRow, "Sierra two-row");
-            ui.selectable_value(algorithm, DitherAlgorithm::Sierra, "Sierra");
-            ui.selectable_value(algorithm, DitherAlgorithm::Stucki, "Stucki");
-            ui.selectable_value(algorithm, DitherAlgorithm::Burkes, "Burkes");
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::JarvisJudiceNinke,
-                "Jarvis–Judice–Ninke",
-            );
-            ui.selectable_value(algorithm, DitherAlgorithm::BlueNoise, "Blue noise");
-            ui.selectable_value(algorithm, DitherAlgorithm::Modulation, "Modulation");
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::Halftone {
-                    shape: HalftoneShape::Dot,
-                },
-                "Dot halftone",
-            );
-            ui.selectable_value(
-                algorithm,
-                DitherAlgorithm::Halftone {
-                    shape: HalftoneShape::Line,
-                },
-                "Line halftone",
-            );
-            for (shape, name) in [
-                (HalftoneShape::Cross, "Cross halftone"),
-                (HalftoneShape::Diamond, "Diamond halftone"),
-                (HalftoneShape::ClusteredDot, "Clustered-dot halftone"),
-            ] {
-                ui.selectable_value(algorithm, DitherAlgorithm::Halftone { shape }, name);
-            }
-        });
+    control_row(ui, "Algorithm", |ui| {
+        egui::ComboBox::from_id_salt("algorithm")
+            .width(ui.available_width())
+            .selected_text(algorithm_name(*algorithm))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::Bayer { matrix_size: 2 },
+                    "Bayer 2×2",
+                );
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::Bayer { matrix_size: 4 },
+                    "Bayer 4×4",
+                );
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::Bayer { matrix_size: 8 },
+                    "Bayer 8×8",
+                );
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::FloydSteinberg,
+                    "Floyd–Steinberg",
+                );
+                ui.selectable_value(algorithm, DitherAlgorithm::Atkinson, "Atkinson");
+                ui.selectable_value(algorithm, DitherAlgorithm::SierraLite, "Sierra Lite");
+                ui.selectable_value(algorithm, DitherAlgorithm::SierraTwoRow, "Sierra two-row");
+                ui.selectable_value(algorithm, DitherAlgorithm::Sierra, "Sierra");
+                ui.selectable_value(algorithm, DitherAlgorithm::Stucki, "Stucki");
+                ui.selectable_value(algorithm, DitherAlgorithm::Burkes, "Burkes");
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::JarvisJudiceNinke,
+                    "Jarvis–Judice–Ninke",
+                );
+                ui.selectable_value(algorithm, DitherAlgorithm::BlueNoise, "Blue noise");
+                ui.selectable_value(algorithm, DitherAlgorithm::Modulation, "Modulation");
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::Halftone {
+                        shape: HalftoneShape::Dot,
+                    },
+                    "Dot halftone",
+                );
+                ui.selectable_value(
+                    algorithm,
+                    DitherAlgorithm::Halftone {
+                        shape: HalftoneShape::Line,
+                    },
+                    "Line halftone",
+                );
+                for (shape, name) in [
+                    (HalftoneShape::Cross, "Cross halftone"),
+                    (HalftoneShape::Diamond, "Diamond halftone"),
+                    (HalftoneShape::ClusteredDot, "Clustered-dot halftone"),
+                ] {
+                    ui.selectable_value(algorithm, DitherAlgorithm::Halftone { shape }, name);
+                }
+            });
+    });
     *algorithm != previous
 }
 
@@ -2375,118 +2572,130 @@ fn algorithm_name(algorithm: DitherAlgorithm) -> &'static str {
 
 fn resampling_selector(ui: &mut egui::Ui, resampling: &mut Resampling) -> bool {
     let previous = *resampling;
-    egui::ComboBox::from_label("Resampling")
-        .selected_text(match resampling {
-            Resampling::Nearest => "Crisp / nearest",
-            Resampling::Bilinear => "Rounded / bilinear",
-            Resampling::Supersample2x => "2× supersampled",
-        })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(resampling, Resampling::Nearest, "Crisp / nearest");
-            ui.selectable_value(resampling, Resampling::Bilinear, "Rounded / bilinear");
-            ui.selectable_value(resampling, Resampling::Supersample2x, "2× supersampled");
-        });
+    control_row(ui, "Resampling", |ui| {
+        egui::ComboBox::from_id_salt("resampling")
+            .width(ui.available_width())
+            .selected_text(match resampling {
+                Resampling::Nearest => "Crisp / nearest",
+                Resampling::Bilinear => "Rounded / bilinear",
+                Resampling::Supersample2x => "2× supersampled",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(resampling, Resampling::Nearest, "Crisp / nearest");
+                ui.selectable_value(resampling, Resampling::Bilinear, "Rounded / bilinear");
+                ui.selectable_value(resampling, Resampling::Supersample2x, "2× supersampled");
+            });
+    });
     *resampling != previous
 }
 
 fn map_pattern_selector(ui: &mut egui::Ui, pattern: &mut MapPattern) -> bool {
     let previous = *pattern;
-    egui::ComboBox::from_label("Map source")
-        .selected_text(match pattern {
-            MapPattern::Imported => "Imported maps",
-            MapPattern::Grain => "Grain",
-            MapPattern::Halftone => "Halftone",
-            MapPattern::Grunge => "Grunge",
-            MapPattern::Splatter => "Splatter",
-        })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(pattern, MapPattern::Imported, "Imported maps");
-            ui.selectable_value(pattern, MapPattern::Grain, "Grain");
-            ui.selectable_value(pattern, MapPattern::Halftone, "Halftone");
-            ui.selectable_value(pattern, MapPattern::Grunge, "Grunge");
-            ui.selectable_value(pattern, MapPattern::Splatter, "Splatter");
-        });
+    control_row(ui, "Map source", |ui| {
+        egui::ComboBox::from_id_salt("map-source")
+            .width(ui.available_width())
+            .selected_text(match pattern {
+                MapPattern::Imported => "Imported maps",
+                MapPattern::Grain => "Grain",
+                MapPattern::Halftone => "Halftone",
+                MapPattern::Grunge => "Grunge",
+                MapPattern::Splatter => "Splatter",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(pattern, MapPattern::Imported, "Imported maps");
+                ui.selectable_value(pattern, MapPattern::Grain, "Grain");
+                ui.selectable_value(pattern, MapPattern::Halftone, "Halftone");
+                ui.selectable_value(pattern, MapPattern::Grunge, "Grunge");
+                ui.selectable_value(pattern, MapPattern::Splatter, "Splatter");
+            });
+    });
     *pattern != previous
 }
 
 fn crt_phase_selector(ui: &mut egui::Ui, phase: &mut CrtPhase) -> bool {
     let previous = *phase;
-    egui::ComboBox::from_label("Phase mode")
-        .selected_text(match phase {
-            CrtPhase::Waveform => "Waveform",
-            CrtPhase::Linear => "Linear",
-            CrtPhase::Flux => "Flux",
-        })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(phase, CrtPhase::Waveform, "Waveform");
-            ui.selectable_value(phase, CrtPhase::Linear, "Linear");
-            ui.selectable_value(phase, CrtPhase::Flux, "Flux");
-        });
+    control_row(ui, "Phase mode", |ui| {
+        egui::ComboBox::from_id_salt("phase-mode")
+            .width(ui.available_width())
+            .selected_text(match phase {
+                CrtPhase::Waveform => "Waveform",
+                CrtPhase::Linear => "Linear",
+                CrtPhase::Flux => "Flux",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(phase, CrtPhase::Waveform, "Waveform");
+                ui.selectable_value(phase, CrtPhase::Linear, "Linear");
+                ui.selectable_value(phase, CrtPhase::Flux, "Flux");
+            });
+    });
     *phase != previous
 }
 
 fn mode_selector(ui: &mut egui::Ui, mode: &mut Separation) -> bool {
     let previous = std::mem::discriminant(mode);
-    egui::ComboBox::from_label("Mode")
-        .selected_text(mode_name(mode))
-        .show_ui(ui, |ui| {
-            if ui
-                .selectable_label(matches!(mode, Separation::Monochrome(_)), "Monochrome")
-                .clicked()
-            {
-                *mode = Separation::Monochrome(Monochrome::default());
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::Tonal(_)), "Tonal gradient")
-                .clicked()
-            {
-                *mode = Separation::Tonal(PaletteSettings::default());
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::Indexed(_)), "Extracted indexed")
-                .clicked()
-            {
-                *mode = Separation::Indexed(PaletteSettings {
-                    colors: Vec::new(),
-                    size: 8,
-                    ..PaletteSettings::default()
-                });
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::Custom(_)), "Custom palette")
-                .clicked()
-            {
-                *mode = Separation::Custom(PaletteSettings::default());
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::Rgb(_)), "RGB plates")
-                .clicked()
-            {
-                let mut rgb = ThreeColor::default();
-                rgb.cyan.color = [0.9, 0.05, 0.05];
-                rgb.magenta.color = [0.05, 0.8, 0.1];
-                rgb.yellow.color = [0.05, 0.2, 0.95];
-                *mode = Separation::Rgb(rgb);
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::ThreeColor(_)), "CMY plates")
-                .clicked()
-            {
-                *mode = Separation::ThreeColor(ThreeColor::default());
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::Cmyk(_)), "CMYK plates")
-                .clicked()
-            {
-                *mode = Separation::Cmyk(FourColor::default());
-            }
-            if ui
-                .selectable_label(matches!(mode, Separation::TriTone(_)), "Tri-tone Xerox")
-                .clicked()
-            {
-                *mode = Separation::TriTone(TriTone::default());
-            }
-        });
+    control_row(ui, "Mode", |ui| {
+        egui::ComboBox::from_id_salt("separation-mode")
+            .width(ui.available_width())
+            .selected_text(mode_name(mode))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(matches!(mode, Separation::Monochrome(_)), "Monochrome")
+                    .clicked()
+                {
+                    *mode = Separation::Monochrome(Monochrome::default());
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::Tonal(_)), "Tonal gradient")
+                    .clicked()
+                {
+                    *mode = Separation::Tonal(PaletteSettings::default());
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::Indexed(_)), "Extracted indexed")
+                    .clicked()
+                {
+                    *mode = Separation::Indexed(PaletteSettings {
+                        colors: Vec::new(),
+                        size: 8,
+                        ..PaletteSettings::default()
+                    });
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::Custom(_)), "Custom palette")
+                    .clicked()
+                {
+                    *mode = Separation::Custom(PaletteSettings::default());
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::Rgb(_)), "RGB plates")
+                    .clicked()
+                {
+                    let mut rgb = ThreeColor::default();
+                    rgb.cyan.color = [0.9, 0.05, 0.05];
+                    rgb.magenta.color = [0.05, 0.8, 0.1];
+                    rgb.yellow.color = [0.05, 0.2, 0.95];
+                    *mode = Separation::Rgb(rgb);
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::ThreeColor(_)), "CMY plates")
+                    .clicked()
+                {
+                    *mode = Separation::ThreeColor(ThreeColor::default());
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::Cmyk(_)), "CMYK plates")
+                    .clicked()
+                {
+                    *mode = Separation::Cmyk(FourColor::default());
+                }
+                if ui
+                    .selectable_label(matches!(mode, Separation::TriTone(_)), "Tri-tone Xerox")
+                    .clicked()
+                {
+                    *mode = Separation::TriTone(TriTone::default());
+                }
+            });
+    });
     std::mem::discriminant(mode) != previous
 }
 
@@ -2505,9 +2714,13 @@ fn mode_name(mode: &Separation) -> &'static str {
 
 fn palette_controls(ui: &mut egui::Ui, settings: &mut PaletteSettings) -> bool {
     sync_palette_inks(settings);
-    let mut changed = ui
-        .add(egui::Slider::new(&mut settings.size, 2..=64).text("Extract colors"))
-        .changed();
+    let mut changed = control_row(ui, "Extract colors", |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(&mut settings.size, 2..=64),
+        )
+    })
+    .changed();
     ui.horizontal(|ui| {
         ui.label("Palette presets");
         if ui.small_button("B/W").clicked() {
@@ -2587,22 +2800,25 @@ fn sync_palette_inks(settings: &mut PaletteSettings) {
 
 fn tone_band(ui: &mut egui::Ui, label: &str, band: &mut ToneBand) -> bool {
     ui.label(RichText::new(label).small().color(Color32::from_gray(165)));
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut band.range[0])
-                    .range(0.0..=1.0)
-                    .prefix("from "),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut band.range[1])
-                    .range(0.0..=1.0)
-                    .prefix("to "),
-            )
-            .changed();
+    let mut changed = control_row(ui, "Range", |ui| {
+        ui.horizontal(|ui| {
+            let mut changed = ui
+                .add(
+                    egui::DragValue::new(&mut band.range[0])
+                        .range(0.0..=1.0)
+                        .prefix("from "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut band.range[1])
+                        .range(0.0..=1.0)
+                        .prefix("to "),
+                )
+                .changed();
+            changed
+        })
+        .inner
     });
     changed |= slider(ui, "Intensity", &mut band.intensity, 0.0..=2.0);
     changed |= slider(ui, "Band grain", &mut band.grain.amount, 0.0..=1.0);
@@ -2676,21 +2892,42 @@ fn asset_control(
     (changed, error)
 }
 
+fn control_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    add_control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(2)
+        .min_col_width(96.0)
+        .spacing(Vec2::new(10.0, 6.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).small().color(MUTED));
+            let response = add_control(ui);
+            ui.end_row();
+            response
+        })
+        .inner
+}
+
 fn slider(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
-    ui.add(egui::Slider::new(value, range).text(label))
-        .changed()
+    control_row(ui, label, |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(value, range).show_value(true),
+        )
+    })
+    .changed()
 }
 
 fn ink(ui: &mut egui::Ui, label: &str, ink: &mut Ink) -> bool {
-    ui.label(RichText::new(label).small().color(Color32::from_gray(165)));
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        changed |= ui.color_edit_button_rgb(&mut ink.color).changed();
+    let mut changed = control_row(ui, label, |ui| {
+        ui.color_edit_button_rgb(&mut ink.color).changed()
     });
     changed |= plate_geometry(ui, ink);
     changed
@@ -2700,59 +2937,73 @@ fn plate_geometry(ui: &mut egui::Ui, ink: &mut Ink) -> bool {
     let mut changed = ui.checkbox(&mut ink.enabled, "Plate enabled").changed();
     changed |= offset_values(ui, &mut ink.offset);
     changed |= slider(ui, "Screen angle", &mut ink.angle_degrees, -180.0..=180.0);
-    changed |= ui
-        .add(egui::Slider::new(&mut ink.bleed_pixels, 0..=16).text("Plate bleed px"))
-        .changed();
-    changed |= ui
-        .add(egui::Slider::new(&mut ink.trapping_pixels, 0..=16).text("Plate trap px"))
-        .changed();
+    changed |= control_row(ui, "Plate bleed px", |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(&mut ink.bleed_pixels, 0..=16),
+        )
+    })
+    .changed();
+    changed |= control_row(ui, "Plate trap px", |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(&mut ink.trapping_pixels, 0..=16),
+        )
+    })
+    .changed();
     changed
 }
 
 fn offset_values(ui: &mut egui::Ui, value: &mut [i32; 2]) -> bool {
-    let mut changed = false;
-    changed |= ui
-        .add(
-            egui::DragValue::new(&mut value[0])
-                .range(-128..=128)
-                .prefix("x "),
-        )
-        .changed();
-    changed |= ui
-        .add(
-            egui::DragValue::new(&mut value[1])
-                .range(-128..=128)
-                .prefix("y "),
-        )
-        .changed();
-    changed
+    control_row(ui, "Offset", |ui| {
+        ui.horizontal(|ui| {
+            let mut changed = ui
+                .add(
+                    egui::DragValue::new(&mut value[0])
+                        .range(-128..=128)
+                        .prefix("x "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut value[1])
+                        .range(-128..=128)
+                        .prefix("y "),
+                )
+                .changed();
+            changed
+        })
+        .inner
+    })
 }
 
 fn variation(ui: &mut egui::Ui, label: &str, seed: &mut u64) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::DragValue::new(seed).range(0..=u64::MAX))
-            .changed()
+    control_row(ui, label, |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::DragValue::new(seed).range(0..=u64::MAX),
+        )
+        .changed()
     })
-    .inner
 }
 
 fn randomizable_variation(ui: &mut egui::Ui, label: &str, seed: &mut u64) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let mut changed = ui
-            .add(egui::DragValue::new(seed).range(0..=u64::MAX))
-            .changed();
-        if ui.small_button("Randomize").clicked() {
-            *seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or_else(|_| seed.wrapping_add(1));
-            changed = true;
-        }
-        changed
+    control_row(ui, label, |ui| {
+        ui.horizontal(|ui| {
+            let mut changed = ui
+                .add(egui::DragValue::new(seed).range(0..=u64::MAX))
+                .changed();
+            if ui.small_button("Randomize").clicked() {
+                *seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or_else(|_| seed.wrapping_add(1));
+                changed = true;
+            }
+            changed
+        })
+        .inner
     })
-    .inner
 }
 
 fn confirmed_options(error: &IoError, mut options: ExportOptions) -> Option<ExportOptions> {
@@ -2767,9 +3018,17 @@ fn confirmed_options(error: &IoError, mut options: ExportOptions) -> Option<Expo
 
 fn section_label(text: &str) -> RichText {
     RichText::new(text)
-        .strong()
         .small()
-        .color(Color32::from_rgb(210, 69, 48))
+        .family(FontFamily::Name(Arc::from("plex-heading")))
+        .color(ACCENT)
+}
+
+fn rgb_color(color: [f32; 3]) -> Color32 {
+    Color32::from_rgb(
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
 }
 
 fn preview_image(image: &RenderedImage) -> egui::ColorImage {
