@@ -1,0 +1,15 @@
+[package]
+name = "dither-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dither-core = { path = "../dither-core" }
+exr = "1.74.2"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "exr", "jpeg", "png", "tiff", "webp"] }
+lcms2 = { version = "6.1.1", features = ["static"] }
+png = "0.18.1"
+rawler = "0.7.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

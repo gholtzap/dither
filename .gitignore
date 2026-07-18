@@ -1,0 +1,16 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local app and tool state
+/.dither/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# OS and editor files
+.DS_Store
+*.swp
+*~
