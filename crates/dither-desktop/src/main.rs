@@ -108,7 +108,17 @@ fn install_native_menu() -> muda::Result<Menu> {
     let view = Submenu::with_items(
         "View",
         true,
-        &[&item("toggle-files", "Toggle Files", None)],
+        &[
+            &item("toggle-files", "Toggle Files", None),
+            &PredefinedMenuItem::separator(),
+            &item("view-effect", "Effect", None),
+            &item("view-original", "Original", None),
+            &item("view-snapshot", "Snapshot", None),
+            &PredefinedMenuItem::separator(),
+            &item("view-fit", "Fit", None),
+            &item("view-actual-size", "Actual Size", None),
+            &item("capture-snapshot", "Capture Snapshot", None),
+        ],
     )?;
     let window = Submenu::with_items(
         "Window",
@@ -1586,6 +1596,32 @@ impl eframe::App for Editor {
                 "duplicate-tab" => self.duplicate_active_tab(),
                 "close-tab" => self.close_active_tab(),
                 "toggle-files" => self.library_open = !self.library_open,
+                "view-effect" => {
+                    self.show_original = false;
+                    self.show_comparison = false;
+                }
+                "view-original" => {
+                    self.show_original = true;
+                    self.show_comparison = false;
+                }
+                "view-snapshot" if self.comparison.is_some() => {
+                    self.show_original = false;
+                    self.show_comparison = true;
+                }
+                "view-fit" => self.scene_rect = egui::Rect::ZERO,
+                "view-actual-size" => {
+                    self.scene_rect =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
+                }
+                "capture-snapshot" => {
+                    self.comparison = self.preview.clone();
+                    self.comparison_recipe = self
+                        .document
+                        .as_ref()
+                        .map(|document| document.recipe.clone());
+                    self.show_comparison = false;
+                    self.status = "Comparison snapshot captured".into();
+                }
                 _ => {}
             }
         }
@@ -2194,58 +2230,6 @@ impl eframe::App for Editor {
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(CANVAS).inner_margin(28.0))
             .show(ui, |ui| {
-                egui::Frame::new()
-                    .fill(PANEL_RAISED)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(4.0)
-                    .inner_margin(6.0)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .selectable_label(
-                                    !self.show_original && !self.show_comparison,
-                                    "Effect",
-                                )
-                                .clicked()
-                            {
-                                self.show_original = false;
-                                self.show_comparison = false;
-                            }
-                            if ui
-                                .selectable_label(self.show_original, "Original")
-                                .clicked()
-                            {
-                                self.show_original = true;
-                                self.show_comparison = false;
-                            }
-                            if self.comparison.is_some()
-                                && ui
-                                    .selectable_label(self.show_comparison, "Snapshot")
-                                    .clicked()
-                            {
-                                self.show_original = false;
-                                self.show_comparison = true;
-                            }
-                            ui.separator();
-                            if ui.small_button("Fit").clicked() {
-                                self.scene_rect = egui::Rect::ZERO;
-                            }
-                            if ui.small_button("100%").clicked() {
-                                self.scene_rect =
-                                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
-                            }
-                            if ui.small_button("Capture").clicked() {
-                                self.comparison = self.preview.clone();
-                                self.comparison_recipe = self
-                                    .document
-                                    .as_ref()
-                                    .map(|document| document.recipe.clone());
-                                self.show_comparison = false;
-                                self.status = "Comparison snapshot captured".into();
-                            }
-                        });
-                    });
-                ui.add_space(10.0);
                 let texture = if self.show_comparison {
                     self.comparison.clone().or_else(|| self.preview.clone())
                 } else if self.show_original {
