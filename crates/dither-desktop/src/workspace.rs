@@ -1,6 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use dither_core::Recipe;
@@ -88,6 +90,41 @@ pub struct ProjectFile {
     pub export: ExportSettings,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectState {
+    pub path: Option<PathBuf>,
+    clean: Option<ProjectFile>,
+}
+
+impl ProjectState {
+    pub fn clean(path: Option<PathBuf>, project: ProjectFile) -> Self {
+        Self {
+            path,
+            clean: Some(project),
+        }
+    }
+
+    pub fn recovered(project_path: Option<PathBuf>) -> Self {
+        Self {
+            path: project_path,
+            clean: None,
+        }
+    }
+
+    pub fn is_dirty(&self, project: &ProjectFile) -> bool {
+        self.clean.as_ref() != Some(project)
+    }
+
+    pub fn mark_saved(&mut self, path: PathBuf, project: ProjectFile) {
+        self.path = Some(path);
+        self.clean = Some(project);
+    }
+
+    pub fn discard_changes(&mut self, project: ProjectFile) {
+        self.clean = Some(project);
+    }
+}
+
 impl Default for ProjectFile {
     fn default() -> Self {
         Self {
@@ -148,10 +185,61 @@ pub fn save_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    if path.exists() && !path.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    let temporary = save_sidecar_path(path, "temporary");
+    let backup = save_sidecar_path(path, "backup");
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    drop(file);
+
+    let had_destination = path.exists();
+    if had_destination && let Err(error) = fs::rename(path, &backup) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let restore = if had_destination {
+            fs::rename(&backup, path)
+        } else {
+            Ok(())
+        };
+        let _ = fs::remove_file(&temporary);
+        return match restore {
+            Ok(()) => Err(error.to_string()),
+            Err(restore) => Err(format!(
+                "{error}; the previous file could not be restored: {restore}"
+            )),
+        };
+    }
+    if had_destination {
+        let _ = fs::remove_file(backup);
+    }
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = fs::File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn save_sidecar_path(path: &Path, kind: &str) -> PathBuf {
+    static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let serial = NEXT_SAVE.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{name}.dither-{kind}-{}-{serial}",
+        std::process::id()
+    ))
 }
 
 pub fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -192,5 +280,36 @@ mod tests {
             state.recent_files,
             [PathBuf::from("one.tif"), PathBuf::from("two.tif")]
         );
+
+        let mut project_state = ProjectState::clean(Some("project.dither".into()), project.clone());
+        assert!(!project_state.is_dirty(&project));
+        let mut edited = project.clone();
+        edited.recipe.preprocess.brightness = 0.25;
+        assert!(project_state.is_dirty(&edited));
+        project_state.mark_saved("project.dither".into(), edited.clone());
+        assert!(!project_state.is_dirty(&edited));
+        assert_eq!(project_state.path, Some("project.dither".into()));
+        assert!(ProjectState::recovered(None).is_dirty(&project));
+    }
+
+    #[test]
+    fn json_save_replaces_the_complete_file_without_sidecars() {
+        let directory =
+            std::env::temp_dir().join(format!("dither-workspace-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("project.dither");
+        let mut project = ProjectFile {
+            source: "first.tif".into(),
+            ..ProjectFile::default()
+        };
+        save_json(&path, &project).unwrap();
+        project.source = "second.tif".into();
+        save_json(&path, &project).unwrap();
+
+        assert_eq!(load_json::<ProjectFile>(&path).unwrap(), project);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

@@ -24,25 +24,26 @@ use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, TextStyle,
     TextureHandle, Vec2,
 };
-use rfd::FileDialog;
 #[cfg(target_os = "macos")]
 use muda::{
     Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
     accelerator::{Accelerator, Code, Modifiers},
 };
+use rfd::FileDialog;
 use workspace::{
-    BrowserSort, ExportRecord, ExportSettings, PersistentState, ProjectFile, SavedExportFormat,
+    BrowserSort, ExportRecord, ExportSettings, PersistentState, ProjectFile, ProjectState,
+    SavedExportFormat,
 };
 
 const PREVIEW_SIZE: NonZeroU32 = NonZeroU32::new(1400).unwrap();
 const THUMBNAIL_SIZE: NonZeroU32 = NonZeroU32::new(128).unwrap();
-const CANVAS: Color32 = Color32::from_rgb(11, 11, 10);
-const PANEL: Color32 = Color32::from_rgb(24, 24, 21);
-const PANEL_RAISED: Color32 = Color32::from_rgb(31, 31, 27);
-const BORDER: Color32 = Color32::from_rgb(52, 52, 45);
-const PAPER: Color32 = Color32::from_rgb(238, 229, 205);
-const MUTED: Color32 = Color32::from_rgb(155, 150, 138);
-const ACCENT: Color32 = Color32::from_rgb(197, 53, 40);
+const CANVAS: Color32 = Color32::from_rgb(17, 17, 17);
+const PANEL: Color32 = Color32::from_rgb(24, 24, 24);
+const PANEL_RAISED: Color32 = Color32::from_rgb(29, 29, 29);
+const BORDER: Color32 = Color32::from_rgb(42, 42, 42);
+const PAPER: Color32 = Color32::from_rgb(232, 232, 232);
+const MUTED: Color32 = Color32::from_rgb(140, 140, 140);
+const ACCENT: Color32 = Color32::from_rgb(93, 93, 93);
 
 #[cfg(target_os = "macos")]
 fn install_native_menu() -> muda::Result<Menu> {
@@ -67,7 +68,7 @@ fn install_native_menu() -> muda::Result<Menu> {
             &PredefinedMenuItem::hide_others(None),
             &PredefinedMenuItem::show_all(None),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::quit(None),
+            &item("quit", "Quit Dither", Some(Code::KeyQ)),
         ],
     )?;
     let file = Submenu::with_items(
@@ -78,7 +79,16 @@ fn install_native_menu() -> muda::Result<Menu> {
             &item("open-new-tab", "Open in New Tab…", None),
             &PredefinedMenuItem::separator(),
             &item("open-project", "Open Project…", None),
-            &item("save-project", "Save Project As…", Some(Code::KeyS)),
+            &item("save-project", "Save", Some(Code::KeyS)),
+            &MenuItem::with_id(
+                "save-project-as",
+                "Save As…",
+                true,
+                Some(Accelerator::new(
+                    Some(Modifiers::SUPER | Modifiers::SHIFT),
+                    Code::KeyS,
+                )),
+            ),
             &PredefinedMenuItem::separator(),
             &item("reload-source", "Reload Source", None),
             &item("relink-source", "Relink Source…", None),
@@ -113,6 +123,7 @@ fn install_native_menu() -> muda::Result<Menu> {
             &PredefinedMenuItem::separator(),
             &item("view-effect", "Effect", None),
             &item("view-original", "Original", None),
+            &item("view-split", "Before and after", None),
             &item("view-snapshot", "Snapshot", None),
             &PredefinedMenuItem::separator(),
             &item("view-fit", "Fit", None),
@@ -203,13 +214,29 @@ struct SavedTab {
     pending_edit: Option<Recipe>,
     show_original: bool,
     show_comparison: bool,
+    show_split: bool,
+    split_fraction: f32,
     comparison: Option<TextureHandle>,
     comparison_recipe: Option<Recipe>,
     scene_rect: egui::Rect,
     plate_view: PlateView,
-    project_path: Option<PathBuf>,
+    project_state: ProjectState,
     export: ExportSettings,
-    dirty: bool,
+}
+
+impl SavedTab {
+    fn project(&self) -> ProjectFile {
+        ProjectFile {
+            source: self.document.source().info.path.clone(),
+            recipe: self.document.recipe.clone(),
+            export: self.export.clone(),
+            ..ProjectFile::default()
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.project_state.is_dirty(&self.project())
+    }
 }
 
 struct BatchResult {
@@ -220,39 +247,30 @@ struct BatchResult {
 
 fn configure_fonts(context: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "plex-sans-condensed".into(),
-        Arc::new(FontData::from_static(include_bytes!(
+    #[cfg(target_os = "macos")]
+    let system_font = fs::read("/System/Library/Fonts/SFNS.ttf").ok();
+    #[cfg(target_os = "windows")]
+    let system_font = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .and_then(|path| fs::read(path.join("Fonts/segoeui.ttf")).ok());
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let system_font = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    .into_iter()
+    .find_map(|path| fs::read(path).ok());
+    let font = system_font.map(FontData::from_owned).unwrap_or_else(|| {
+        FontData::from_static(include_bytes!(
             "../assets/fonts/IBMPlexSansCondensed-Regular.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        "plex-sans-condensed-semibold".into(),
-        Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/IBMPlexSansCondensed-SemiBold.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        "plex-mono".into(),
-        Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/IBMPlexMono-Regular.ttf"
-        ))),
-    );
+        ))
+    });
+    fonts.font_data.insert("system-sans".into(), Arc::new(font));
     fonts
         .families
         .get_mut(&FontFamily::Proportional)
         .unwrap()
-        .insert(0, "plex-sans-condensed".into());
-    fonts
-        .families
-        .get_mut(&FontFamily::Monospace)
-        .unwrap()
-        .insert(0, "plex-mono".into());
-    let mut heading_fonts = vec!["plex-sans-condensed-semibold".into()];
-    heading_fonts.extend(fonts.families[&FontFamily::Proportional].clone());
-    fonts
-        .families
-        .insert(FontFamily::Name(Arc::from("plex-heading")), heading_fonts);
+        .insert(0, "system-sans".into());
     context.set_fonts(fonts);
 }
 
@@ -299,6 +317,8 @@ struct Editor {
     pending_edit: Option<Recipe>,
     show_original: bool,
     show_comparison: bool,
+    show_split: bool,
+    split_fraction: f32,
     scene_rect: egui::Rect,
     comparison: Option<TextureHandle>,
     comparison_recipe: Option<Recipe>,
@@ -309,27 +329,43 @@ struct Editor {
     active_tab: usize,
     open_in_new_tab: bool,
     preserve_recipe_on_replace: bool,
-    project_path: Option<PathBuf>,
-    dirty: bool,
+    project_state: Option<ProjectState>,
     source_modified: Option<SystemTime>,
     last_source_check: Instant,
     batch_results: Vec<BatchResult>,
     batch_running: bool,
-    pending_open: Option<PathBuf>,
+    pending_action: Option<PendingAction>,
+    quit_after_export: bool,
+    allow_close: bool,
+}
+
+#[derive(Clone)]
+struct OpenSpec {
+    project: ProjectFile,
+    state: ProjectState,
+    new_tab: bool,
+}
+
+#[derive(Clone)]
+enum PendingAction {
+    Open(Box<OpenSpec>),
+    CloseTab,
+    Quit,
 }
 
 enum JobResult {
     Opened {
         request: u64,
-        new_tab: bool,
-        recipe: Box<Recipe>,
+        spec: Box<OpenSpec>,
         result: Box<Result<(Document, RenderedImage), String>>,
     },
     Previewed {
         request: u64,
         image: RenderedDocument,
+        original: RenderedImage,
     },
     Exported {
+        source: PathBuf,
         path: PathBuf,
         format: ExportFormat,
         options: ExportOptions,
@@ -366,10 +402,10 @@ impl Editor {
         style.visuals.panel_fill = PANEL;
         style.visuals.window_fill = PANEL_RAISED;
         style.visuals.extreme_bg_color = CANVAS;
-        style.visuals.faint_bg_color = Color32::from_rgb(35, 35, 30);
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 42, 37);
+        style.visuals.faint_bg_color = Color32::from_rgb(35, 35, 35);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 42, 42);
         style.visuals.widgets.inactive.fg_stroke.color = PAPER;
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(57, 57, 49);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(57, 57, 57);
         style.visuals.widgets.hovered.fg_stroke.color = PAPER;
         style.visuals.widgets.active.bg_fill = ACCENT;
         style.visuals.selection.bg_fill = ACCENT;
@@ -377,14 +413,14 @@ impl Editor {
         style.animation_time = 0.14;
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(21.0, FontFamily::Name(Arc::from("plex-heading"))),
+            FontId::new(18.0, FontFamily::Proportional),
         );
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+            .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(14.0, FontFamily::Proportional),
+            FontId::new(13.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Small,
@@ -432,6 +468,8 @@ impl Editor {
             pending_edit: None,
             show_original: false,
             show_comparison: false,
+            show_split: false,
+            split_fraction: 0.5,
             scene_rect: egui::Rect::ZERO,
             comparison: None,
             comparison_recipe: None,
@@ -442,20 +480,21 @@ impl Editor {
             active_tab: 0,
             open_in_new_tab: false,
             preserve_recipe_on_replace: true,
-            project_path: None,
-            dirty: false,
+            project_state: None,
             source_modified: None,
             last_source_check: Instant::now(),
             batch_results: Vec::new(),
             batch_running: false,
-            pending_open: None,
+            pending_action: None,
+            quit_after_export: false,
+            allow_close: false,
         };
         if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
             editor.open_path(path, &context.egui_ctx);
         } else if let Ok(project) = workspace::load_json::<ProjectFile>(&recovery_path())
             && project.source.exists()
         {
-            editor.open_project_data(project, true, &context.egui_ctx);
+            editor.open_project_data(project, None, false, true, &context.egui_ctx);
             editor.status = "Recovered the previous autosaved session".into();
         } else if let Some(folder) = editor.persistent.last_folder.clone() {
             editor.load_folder(folder, &context.egui_ctx);
@@ -477,11 +516,6 @@ impl Editor {
     }
 
     fn open_path(&mut self, path: PathBuf, context: &egui::Context) {
-        if self.dirty && self.document.is_some() {
-            self.pending_open = Some(path);
-            self.status = "Save or discard the current project before replacing it".into();
-            return;
-        }
         let recipe = if self.preserve_recipe_on_replace {
             self.document
                 .as_ref()
@@ -490,44 +524,76 @@ impl Editor {
         } else {
             Recipe::default()
         };
-        self.open_path_with_recipe(path, recipe, self.open_in_new_tab, context);
+        let project = ProjectFile {
+            source: path,
+            recipe,
+            export: self.persistent.default_export.clone(),
+            ..ProjectFile::default()
+        };
+        let spec = OpenSpec {
+            state: ProjectState::clean(None, project.clone()),
+            project,
+            new_tab: self.open_in_new_tab,
+        };
+        self.request_open(spec, context);
     }
 
-    fn open_path_with_recipe(
-        &mut self,
-        path: PathBuf,
-        recipe: Recipe,
-        new_tab: bool,
-        context: &egui::Context,
-    ) {
+    fn request_open(&mut self, spec: OpenSpec, context: &egui::Context) {
+        if !spec.new_tab && self.is_dirty() {
+            self.pending_action = Some(PendingAction::Open(Box::new(spec)));
+            self.status = "Save or discard the current project before replacing it".into();
+        } else {
+            self.start_open(spec, context);
+        }
+    }
+
+    fn start_open(&mut self, spec: OpenSpec, context: &egui::Context) {
         self.open_request = self.open_request.wrapping_add(1);
         let request = self.open_request;
         let sender = self.jobs.clone();
         let repaint = context.clone();
+        let path = spec.project.source.clone();
         self.opening = true;
         self.status = format!("Opening {}…", path.display());
         thread::spawn(move || {
-            let result = dither_io::open(path)
+            let result = dither_io::open(&path)
                 .map(|source| {
-                    let document = Document::new(source);
+                    let mut document = Document::new(source);
+                    document.recipe = spec.project.recipe.clone();
                     let preview = document.render_source_preview(PREVIEW_SIZE);
                     (document, preview)
                 })
                 .map_err(|error| error.to_string());
             let _ = sender.send(JobResult::Opened {
                 request,
-                new_tab,
-                recipe: Box::new(recipe),
+                spec: Box::new(spec),
                 result: Box::new(result),
             });
             repaint.request_repaint();
         });
     }
 
-    fn open_project_data(&mut self, project: ProjectFile, new_tab: bool, context: &egui::Context) {
-        self.export_settings = project.export;
-        self.project_path = None;
-        self.open_path_with_recipe(project.source, project.recipe, new_tab, context);
+    fn open_project_data(
+        &mut self,
+        project: ProjectFile,
+        path: Option<PathBuf>,
+        clean: bool,
+        new_tab: bool,
+        context: &egui::Context,
+    ) {
+        let state = if clean {
+            ProjectState::clean(path, project.clone())
+        } else {
+            ProjectState::recovered(path)
+        };
+        self.request_open(
+            OpenSpec {
+                project,
+                state,
+                new_tab,
+            },
+            context,
+        );
     }
 
     fn schedule_preview(&mut self, context: &egui::Context) {
@@ -551,7 +617,12 @@ impl Editor {
         self.preview_in_flight = true;
         thread::spawn(move || {
             let image = document.render_document_preview(PREVIEW_SIZE);
-            let _ = sender.send(JobResult::Previewed { request, image });
+            let original = document.render_source_preview(PREVIEW_SIZE);
+            let _ = sender.send(JobResult::Previewed {
+                request,
+                image,
+                original,
+            });
             repaint.request_repaint();
         });
     }
@@ -561,14 +632,13 @@ impl Editor {
             match job {
                 JobResult::Opened {
                     request,
-                    new_tab,
-                    recipe,
+                    spec,
                     result,
                 } if request == self.open_request => {
                     self.opening = false;
                     match *result {
                         Ok((mut document, original)) => {
-                            if new_tab && self.document.is_some() {
+                            if spec.new_tab && self.document.is_some() {
                                 self.stash_active_tab();
                                 self.tabs.push(None);
                                 self.active_tab = self.tabs.len() - 1;
@@ -576,12 +646,11 @@ impl Editor {
                                 self.tabs.push(None);
                                 self.active_tab = 0;
                             }
-                            document.recipe = *recipe;
                             let asset_errors = load_recipe_assets(&mut document);
                             let source = document.source();
                             let source_path = source.info.path.clone();
                             self.status = format!(
-                                "{} × {}  ·  {}-bit {}",
+                                "Opened {} × {} pixels, {}-bit {}.",
                                 source.width(),
                                 source.height(),
                                 source.info.bit_depth,
@@ -589,7 +658,7 @@ impl Editor {
                             );
                             if !asset_errors.is_empty() {
                                 self.status.push_str(&format!(
-                                    "  ·  {} asset(s) unavailable",
+                                    " {} assets are unavailable.",
                                     asset_errors.len()
                                 ));
                             }
@@ -608,12 +677,13 @@ impl Editor {
                             self.pending_edit = None;
                             self.show_original = false;
                             self.show_comparison = false;
+                            self.show_split = false;
+                            self.split_fraction = 0.5;
                             self.comparison = None;
                             self.comparison_recipe = None;
                             self.scene_rect = egui::Rect::ZERO;
-                            self.project_path = None;
-                            self.export_settings = self.persistent.default_export.clone();
-                            self.dirty = false;
+                            self.project_state = Some(spec.state);
+                            self.export_settings = spec.project.export;
                             self.source_modified = file_modified(&source_path);
                             self.persistent.remember_file(source_path.clone());
                             self.set_active_tab_label(&source_path);
@@ -625,13 +695,22 @@ impl Editor {
                     }
                 }
                 JobResult::Opened { .. } => {}
-                JobResult::Previewed { request, image } => {
+                JobResult::Previewed {
+                    request,
+                    image,
+                    original,
+                } => {
                     self.preview_in_flight = false;
                     if request == self.preview_request {
                         let color = preview_image(&image.composite);
                         self.preview = Some(context.load_texture(
                             "document-preview",
                             color,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.original_preview = Some(context.load_texture(
+                            "original-preview",
+                            preview_image(&original),
                             egui::TextureOptions::LINEAR,
                         ));
                         self.plate_previews = image
@@ -665,6 +744,7 @@ impl Editor {
                     }
                 }
                 JobResult::Exported {
+                    source,
                     path,
                     format,
                     options,
@@ -681,11 +761,7 @@ impl Editor {
                                 format!("Exported {}", path.display())
                             };
                             self.persistent.remember_export(ExportRecord {
-                                source: self
-                                    .document
-                                    .as_ref()
-                                    .map(|document| document.source().info.path.clone())
-                                    .unwrap_or_default(),
+                                source,
                                 outputs,
                                 completed_unix_seconds: unix_seconds(),
                             });
@@ -705,6 +781,10 @@ impl Editor {
                                 self.status = format!("Export failed: {error}");
                             }
                         }
+                    }
+                    if self.quit_after_export {
+                        self.quit_after_export = false;
+                        self.request_quit(context);
                     }
                 }
                 JobResult::Thumbnail {
@@ -798,6 +878,7 @@ impl Editor {
         }
 
         let document = document.clone();
+        let source = document.source().info.path.clone();
         let sender = self.jobs.clone();
         self.export_cancel = Arc::new(AtomicBool::new(false));
         self.export_progress = Arc::new(AtomicU8::new(0));
@@ -821,6 +902,7 @@ impl Editor {
             let outputs = exported.as_ref().cloned().unwrap_or_default();
             let result = exported.map(|_| ());
             let _ = sender.send(JobResult::Exported {
+                source,
                 path,
                 format,
                 options,
@@ -849,13 +931,17 @@ impl Editor {
             pending_edit: self.pending_edit.take(),
             show_original: self.show_original,
             show_comparison: self.show_comparison,
+            show_split: self.show_split,
+            split_fraction: self.split_fraction,
             comparison: self.comparison.take(),
             comparison_recipe: self.comparison_recipe.take(),
             scene_rect: self.scene_rect,
             plate_view: self.plate_view,
-            project_path: self.project_path.take(),
+            project_state: self
+                .project_state
+                .take()
+                .expect("an open document has project state"),
             export: self.export_settings.clone(),
-            dirty: self.dirty,
         });
     }
 
@@ -876,20 +962,21 @@ impl Editor {
         self.pending_edit = tab.pending_edit;
         self.show_original = tab.show_original;
         self.show_comparison = tab.show_comparison;
+        self.show_split = tab.show_split;
+        self.split_fraction = tab.split_fraction;
         self.comparison = tab.comparison;
         self.comparison_recipe = tab.comparison_recipe;
         self.scene_rect = tab.scene_rect;
         self.plate_view = tab.plate_view;
-        self.project_path = tab.project_path;
+        self.project_state = Some(tab.project_state);
         self.export_settings = tab.export;
-        self.dirty = tab.dirty;
         self.source_modified = self
             .document
             .as_ref()
             .and_then(|document| file_modified(&document.source().info.path));
     }
 
-    fn close_active_tab(&mut self) {
+    fn close_active_tab_now(&mut self) {
         if self.tabs.len() <= 1 {
             self.document = None;
             self.preview = None;
@@ -898,8 +985,11 @@ impl Editor {
             self.comparison = None;
             self.comparison_recipe = None;
             self.show_comparison = false;
+            self.show_split = false;
             self.tabs.clear();
             self.tab_labels.clear();
+            self.project_state = None;
+            let _ = fs::remove_file(recovery_path());
             return;
         }
         self.tabs.remove(self.active_tab);
@@ -921,13 +1011,64 @@ impl Editor {
         self.pending_edit = tab.pending_edit;
         self.show_original = tab.show_original;
         self.show_comparison = tab.show_comparison;
+        self.show_split = tab.show_split;
+        self.split_fraction = tab.split_fraction;
         self.comparison = tab.comparison;
         self.comparison_recipe = tab.comparison_recipe;
         self.scene_rect = tab.scene_rect;
         self.plate_view = tab.plate_view;
-        self.project_path = tab.project_path;
+        self.project_state = Some(tab.project_state);
         self.export_settings = tab.export;
-        self.dirty = tab.dirty;
+    }
+
+    fn request_close_active_tab(&mut self) {
+        if self.is_dirty() {
+            self.pending_action = Some(PendingAction::CloseTab);
+        } else {
+            self.close_active_tab_now();
+        }
+    }
+
+    fn request_quit(&mut self, context: &egui::Context) {
+        if self.exporting {
+            self.quit_after_export = true;
+            self.export_cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping export before quitting".into();
+            return;
+        }
+        if self.is_dirty() {
+            self.pending_action = Some(PendingAction::Quit);
+            return;
+        }
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.as_ref().is_some_and(SavedTab::is_dirty))
+        {
+            self.switch_tab(index);
+            self.pending_action = Some(PendingAction::Quit);
+            return;
+        }
+        self.allow_close = true;
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn continue_pending_action(
+        &mut self,
+        action: PendingAction,
+        discarded: bool,
+        context: &egui::Context,
+    ) {
+        match action {
+            PendingAction::Open(spec) => self.start_open(*spec, context),
+            PendingAction::CloseTab => self.close_active_tab_now(),
+            PendingAction::Quit => {
+                if discarded {
+                    self.discard_current_changes();
+                }
+                self.request_quit(context);
+            }
+        }
     }
 
     fn duplicate_active_tab(&mut self) {
@@ -947,15 +1088,22 @@ impl Editor {
         self.tabs.push(Some(tab));
         self.tab_labels.push(label);
         self.switch_tab(self.tabs.len() - 1);
-        self.dirty = true;
-        self.project_path = None;
+        if let Some(project) = self.current_project() {
+            self.project_state = Some(ProjectState::recovered(None));
+            self.autosave_recovery();
+            self.status = format!(
+                "Duplicated {}",
+                project
+                    .source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+        }
     }
 
     fn relink_source(&mut self, context: &egui::Context) {
-        let Some(recipe) = self
-            .document
-            .as_ref()
-            .map(|document| document.recipe.clone())
+        let (Some(mut project), Some(state)) = (self.current_project(), self.project_state.clone())
         else {
             return;
         };
@@ -965,7 +1113,15 @@ impl Editor {
             .add_filter("Supported images", &extensions)
             .pick_file()
         {
-            self.open_path_with_recipe(path, recipe, false, context);
+            project.source = path;
+            self.start_open(
+                OpenSpec {
+                    project,
+                    state,
+                    new_tab: false,
+                },
+                context,
+            );
         }
     }
 
@@ -988,6 +1144,20 @@ impl Editor {
             export: self.export_settings.clone(),
             ..ProjectFile::default()
         })
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.current_project()
+            .zip(self.project_state.as_ref())
+            .is_some_and(|(project, state)| state.is_dirty(&project))
+    }
+
+    fn discard_current_changes(&mut self) {
+        if let Some(project) = self.current_project()
+            && let Some(state) = &mut self.project_state
+        {
+            state.discard_changes(project);
+        }
     }
 
     fn autosave_recovery(&self) {
@@ -1060,28 +1230,55 @@ impl Editor {
         }
     }
 
-    fn save_project_as(&mut self) {
-        let Some(project) = self.current_project() else {
-            return;
-        };
+    fn save_project(&mut self) -> bool {
+        if let Some(path) = self
+            .project_state
+            .as_ref()
+            .and_then(|state| state.path.clone())
+        {
+            self.save_project_to(path)
+        } else {
+            self.save_project_as()
+        }
+    }
+
+    fn save_project_as(&mut self) -> bool {
+        if self.document.is_none() {
+            return false;
+        }
         let Some(mut path) = FileDialog::new()
             .set_title("Save Dither project")
             .set_file_name("project.dither")
             .add_filter("Dither project", &["dither"])
             .save_file()
         else {
-            return;
+            return false;
         };
         if path.extension().is_none() {
             path.set_extension("dither");
         }
+        self.save_project_to(path)
+    }
+
+    fn save_project_to(&mut self, path: PathBuf) -> bool {
+        let Some(project) = self.current_project() else {
+            return false;
+        };
         match workspace::save_json(&path, &project) {
             Ok(()) => {
-                self.project_path = Some(path.clone());
-                self.dirty = false;
+                if let Some(state) = &mut self.project_state {
+                    state.mark_saved(path.clone(), project);
+                } else {
+                    self.project_state = Some(ProjectState::clean(Some(path.clone()), project));
+                }
                 self.status = format!("Saved project {}", path.display());
+                let _ = fs::remove_file(recovery_path());
+                true
             }
-            Err(error) => self.status = format!("Project save failed: {error}"),
+            Err(error) => {
+                self.status = format!("Project save failed: {error}");
+                false
+            }
         }
     }
 
@@ -1095,19 +1292,20 @@ impl Editor {
         };
         match workspace::load_json::<ProjectFile>(&path) {
             Ok(project) => {
-                self.project_path = Some(path);
-                self.open_project_data(project, self.open_in_new_tab, context);
+                self.open_project_data(project, Some(path), true, self.open_in_new_tab, context);
             }
             Err(error) => self.status = format!("Project open failed: {error}"),
         }
     }
 
     fn reload_source(&mut self, context: &egui::Context) {
-        if let Some(document) = &self.document {
-            self.open_path_with_recipe(
-                document.source().info.path.clone(),
-                document.recipe.clone(),
-                false,
+        if let (Some(project), Some(state)) = (self.current_project(), self.project_state.clone()) {
+            self.start_open(
+                OpenSpec {
+                    project,
+                    state,
+                    new_tab: false,
+                },
                 context,
             );
         }
@@ -1206,12 +1404,8 @@ impl Editor {
         {
             self.undo.push(previous);
             self.redo.clear();
-            self.dirty = true;
             save_recipe(&self.recipe);
             self.autosave_recovery();
-            if let (Some(path), Some(project)) = (&self.project_path, self.current_project()) {
-                let _ = workspace::save_json(path, &project);
-            }
         }
     }
 
@@ -1226,6 +1420,7 @@ impl Editor {
         let _ = load_recipe_assets(document);
         self.recipe = recipe;
         save_recipe(&self.recipe);
+        self.autosave_recovery();
         self.schedule_preview(context);
     }
 
@@ -1240,19 +1435,60 @@ impl Editor {
         let _ = load_recipe_assets(document);
         self.recipe = recipe;
         save_recipe(&self.recipe);
+        self.autosave_recovery();
         self.schedule_preview(context);
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(document) = &mut self.document else {
             ui.add_space(16.0);
-            ui.label(RichText::new("NO DOCUMENT").color(Color32::from_gray(125)));
+            ui.label(RichText::new("No document").color(Color32::from_gray(125)));
             return false;
         };
         let mut changed = false;
 
+        egui::CollapsingHeader::new("Geometry")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Rotate left").clicked() {
+                        document.recipe.transform.quarter_turns =
+                            (document.recipe.transform.quarter_turns + 3) % 4;
+                        changed = true;
+                    }
+                    if ui.button("Rotate right").clicked() {
+                        document.recipe.transform.quarter_turns =
+                            (document.recipe.transform.quarter_turns + 1) % 4;
+                        changed = true;
+                    }
+                    if ui.button("Reset geometry").clicked() {
+                        document.recipe.transform = dither_core::Transform::default();
+                        changed = true;
+                    }
+                });
+                changed |= slider(
+                    ui,
+                    "Straighten",
+                    &mut document.recipe.transform.straighten_degrees,
+                    -45.0..=45.0,
+                );
+                let [mut left, mut top, mut right, mut bottom] = document.recipe.transform.crop;
+                changed |= crop_slider(ui, "Crop left", &mut left, 0.0..=right - 0.01);
+                changed |= crop_slider(ui, "Crop top", &mut top, 0.0..=bottom - 0.01);
+                changed |= crop_slider(ui, "Crop right", &mut right, left + 0.01..=1.0);
+                changed |= crop_slider(ui, "Crop bottom", &mut bottom, top + 0.01..=1.0);
+                document.recipe.transform.crop = [left, top, right, bottom];
+                let (width, height) = document.output_dimensions();
+                ui.label(
+                    RichText::new(format!("Output size: {} × {} pixels", width, height))
+                        .small()
+                        .color(MUTED),
+                );
+            });
+        ui.add_space(8.0);
+
         ui.horizontal(|ui| {
-            ui.label(section_label("DITHER"));
+            ui.label(section_label("Dither"));
             if ui.small_button("Reset all").clicked() {
                 document.recipe = Recipe::default();
                 let _ = load_recipe_assets(document);
@@ -1284,7 +1520,7 @@ impl Editor {
         });
 
         ui.add_space(18.0);
-        ui.label(section_label("PRE-DITHER"));
+        ui.label(section_label("Tone"));
         changed |= slider(
             ui,
             "Brightness",
@@ -1338,7 +1574,7 @@ impl Editor {
             .changed();
 
         ui.add_space(18.0);
-        ui.label(section_label("COLOR / PLATES"));
+        ui.label(section_label("Color and plates"));
         changed |= mode_selector(ui, &mut document.recipe.separation);
         ui.add_space(8.0);
 
@@ -1390,186 +1626,209 @@ impl Editor {
             changed = true;
         }
 
-        ui.add_space(18.0);
-        ui.label(section_label("PRINT"));
-        changed |= slider(ui, "DPI", &mut document.recipe.print.dpi, 36.0..=2400.0);
-        changed |= slider(ui, "LPI", &mut document.recipe.print.lpi, 5.0..=300.0);
-        changed |= control_row(ui, "Bleed px", |ui| {
-            ui.add_sized(
-                [ui.available_width(), 18.0],
-                egui::Slider::new(&mut document.recipe.print.bleed_pixels, 0..=16),
-            )
-        })
-        .changed();
-        changed |= control_row(ui, "Trapping px", |ui| {
-            ui.add_sized(
-                [ui.available_width(), 18.0],
-                egui::Slider::new(&mut document.recipe.print.trapping_pixels, 0..=16),
-            )
-        })
-        .changed();
-
-        ui.add_space(18.0);
-        ui.label(section_label("TRI-TONE TEXTURES / DISPLACE"));
-        let (asset_changed, asset_error) = asset_control(
-            ui,
-            document,
-            AssetKind::PaperTexture,
-            "Paper / photocopy texture",
-        );
-        changed |= asset_changed;
-        if let Some(error) = asset_error {
-            self.status = format!("Texture import failed: {error}");
-        }
-        let (asset_changed, asset_error) =
-            asset_control(ui, document, AssetKind::DisplacementMap, "Displacement map");
-        changed |= asset_changed;
-        if let Some(error) = asset_error {
-            self.status = format!("Displacement import failed: {error}");
-        }
-        let (asset_changed, asset_error) = asset_control(
-            ui,
-            document,
-            AssetKind::DistressMask,
-            "Distress texture / brush mask",
-        );
-        changed |= asset_changed;
-        if let Some(error) = asset_error {
-            self.status = format!("Distress import failed: {error}");
-        }
-        changed |= ui
-            .checkbox(
-                &mut document.recipe.displacement.enabled,
-                "Enable displacement",
-            )
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Print setup").show(ui, |ui| {
+            changed |= slider(
+                ui,
+                "Resolution (dpi)",
+                &mut document.recipe.print.dpi,
+                36.0..=2400.0,
+            );
+            changed |= slider(
+                ui,
+                "Screen frequency (lpi)",
+                &mut document.recipe.print.lpi,
+                5.0..=300.0,
+            );
+            changed |= control_row(ui, "Bleed (px)", |ui| {
+                ui.add_sized(
+                    [ui.available_width(), 18.0],
+                    egui::Slider::new(&mut document.recipe.print.bleed_pixels, 0..=16),
+                )
+            })
             .changed();
-        changed |= map_pattern_selector(ui, &mut document.recipe.displacement.pattern);
-        changed |= slider(
-            ui,
-            "Map scale",
-            &mut document.recipe.displacement.pattern_scale,
-            2.0..=256.0,
-        );
-        changed |=
-            randomizable_variation(ui, "Map variation", &mut document.recipe.displacement.seed);
-        changed |= slider(
-            ui,
-            "X strength",
-            &mut document.recipe.displacement.x_strength,
-            -128.0..=128.0,
-        );
-        changed |= slider(
-            ui,
-            "Y strength",
-            &mut document.recipe.displacement.y_strength,
-            -128.0..=128.0,
-        );
-        changed |= slider(
-            ui,
-            "Distress",
-            &mut document.recipe.displacement.distress_amount,
-            0.0..=1.0,
-        );
-
-        ui.add_space(18.0);
-        ui.label(section_label("HIGHLIGHT GLOW"));
-        changed |= ui
-            .checkbox(&mut document.recipe.glow.enabled, "Enable glow")
+            changed |= control_row(ui, "Trapping (px)", |ui| {
+                ui.add_sized(
+                    [ui.available_width(), 18.0],
+                    egui::Slider::new(&mut document.recipe.print.trapping_pixels, 0..=16),
+                )
+            })
             .changed();
-        changed |= slider(
-            ui,
-            "Threshold",
-            &mut document.recipe.glow.threshold,
-            0.0..=1.0,
-        );
-        changed |= slider(ui, "Radius", &mut document.recipe.glow.radius, 0.0..=64.0);
-        changed |= slider(ui, "Falloff", &mut document.recipe.glow.falloff, 1.0..=4.0);
-        changed |= slider(
-            ui,
-            "Intensity",
-            &mut document.recipe.glow.intensity,
-            0.0..=4.0,
-        );
-        changed |= slider(ui, "Gamma", &mut document.recipe.glow.gamma, 0.1..=4.0);
-        changed |= slider(
-            ui,
-            "Saturation",
-            &mut document.recipe.glow.saturation,
-            0.0..=3.0,
-        );
-        control_row(ui, "Tint", |ui| {
-            changed |= ui
-                .color_edit_button_rgb(&mut document.recipe.glow.tint)
-                .changed();
         });
 
-        ui.add_space(18.0);
-        ui.label(section_label("CRT PHASER"));
-        changed |= ui
-            .checkbox(&mut document.recipe.crt.enabled, "Enable CRT")
-            .changed();
-        changed |= crt_phase_selector(ui, &mut document.recipe.crt.phase);
-        changed |= slider(
-            ui,
-            "Wave strength",
-            &mut document.recipe.crt.wave_strength,
-            0.0..=128.0,
-        );
-        changed |= slider(
-            ui,
-            "Wave frequency",
-            &mut document.recipe.crt.wave_frequency,
-            0.1..=64.0,
-        );
-        changed |= slider(
-            ui,
-            "Scanlines",
-            &mut document.recipe.crt.scanlines,
-            0.0..=1.0,
-        );
-        changed |= slider(
-            ui,
-            "RGB bleed",
-            &mut document.recipe.crt.rgb_bleed,
-            0.0..=24.0,
-        );
-        changed |= slider(
-            ui,
-            "Sync tearing",
-            &mut document.recipe.crt.sync_tearing,
-            0.0..=128.0,
-        );
-        changed |= slider(
-            ui,
-            "Phosphor mask",
-            &mut document.recipe.crt.phosphor_mask,
-            0.0..=1.0,
-        );
-        changed |= slider(ui, "Bloom", &mut document.recipe.crt.bloom, 0.0..=2.0);
-
-        ui.add_space(18.0);
-        ui.label(section_label("SURFACE"));
-        changed |= slider(ui, "Grain", &mut document.recipe.grain.amount, 0.0..=0.8);
-        changed |= slider(
-            ui,
-            "Grain scale",
-            &mut document.recipe.grain.scale,
-            0.25..=12.0,
-        );
-        changed |= randomizable_variation(ui, "Grain variation", &mut document.recipe.grain.seed);
-        changed |= slider(ui, "Paper", &mut document.recipe.paper.amount, 0.0..=0.5);
-        changed |= slider(
-            ui,
-            "Paper scale",
-            &mut document.recipe.paper.scale,
-            0.5..=24.0,
-        );
-        changed |= variation(ui, "Paper variation", &mut document.recipe.paper.seed);
-        control_row(ui, "Paper tone", |ui| {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Textures and displacement").show(ui, |ui| {
+            let (asset_changed, asset_error) =
+                asset_control(ui, document, AssetKind::PaperTexture, "Paper texture");
+            changed |= asset_changed;
+            if let Some(error) = asset_error {
+                self.status = format!("Texture import failed: {error}");
+            }
+            let (asset_changed, asset_error) =
+                asset_control(ui, document, AssetKind::DisplacementMap, "Displacement map");
+            changed |= asset_changed;
+            if let Some(error) = asset_error {
+                self.status = format!("Displacement import failed: {error}");
+            }
+            let (asset_changed, asset_error) =
+                asset_control(ui, document, AssetKind::DistressMask, "Distress mask");
+            changed |= asset_changed;
+            if let Some(error) = asset_error {
+                self.status = format!("Distress import failed: {error}");
+            }
             changed |= ui
-                .color_edit_button_rgb(&mut document.recipe.paper_color)
+                .checkbox(
+                    &mut document.recipe.displacement.enabled,
+                    "Enable displacement",
+                )
                 .changed();
+            ui.add_enabled_ui(document.recipe.displacement.enabled, |ui| {
+                changed |= map_pattern_selector(ui, &mut document.recipe.displacement.pattern);
+                changed |= slider(
+                    ui,
+                    "Map scale",
+                    &mut document.recipe.displacement.pattern_scale,
+                    2.0..=256.0,
+                );
+                changed |= randomizable_variation(
+                    ui,
+                    "Map variation",
+                    &mut document.recipe.displacement.seed,
+                );
+                changed |= slider(
+                    ui,
+                    "X strength",
+                    &mut document.recipe.displacement.x_strength,
+                    -128.0..=128.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Y strength",
+                    &mut document.recipe.displacement.y_strength,
+                    -128.0..=128.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Distress",
+                    &mut document.recipe.displacement.distress_amount,
+                    0.0..=1.0,
+                );
+            });
         });
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Highlight glow").show(ui, |ui| {
+            changed |= ui
+                .checkbox(&mut document.recipe.glow.enabled, "Enable glow")
+                .changed();
+            ui.add_enabled_ui(document.recipe.glow.enabled, |ui| {
+                changed |= slider(
+                    ui,
+                    "Threshold",
+                    &mut document.recipe.glow.threshold,
+                    0.0..=1.0,
+                );
+                changed |= slider(ui, "Radius", &mut document.recipe.glow.radius, 0.0..=64.0);
+                changed |= slider(ui, "Falloff", &mut document.recipe.glow.falloff, 1.0..=4.0);
+                changed |= slider(
+                    ui,
+                    "Intensity",
+                    &mut document.recipe.glow.intensity,
+                    0.0..=4.0,
+                );
+                changed |= slider(ui, "Gamma", &mut document.recipe.glow.gamma, 0.1..=4.0);
+                changed |= slider(
+                    ui,
+                    "Saturation",
+                    &mut document.recipe.glow.saturation,
+                    0.0..=3.0,
+                );
+                control_row(ui, "Tint", |ui| {
+                    changed |= ui
+                        .color_edit_button_rgb(&mut document.recipe.glow.tint)
+                        .changed();
+                });
+            });
+        });
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Display distortion").show(ui, |ui| {
+            changed |= ui
+                .checkbox(
+                    &mut document.recipe.crt.enabled,
+                    "Enable display distortion",
+                )
+                .changed();
+            ui.add_enabled_ui(document.recipe.crt.enabled, |ui| {
+                changed |= crt_phase_selector(ui, &mut document.recipe.crt.phase);
+                changed |= slider(
+                    ui,
+                    "Wave strength",
+                    &mut document.recipe.crt.wave_strength,
+                    0.0..=128.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Wave frequency",
+                    &mut document.recipe.crt.wave_frequency,
+                    0.1..=64.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Scanlines",
+                    &mut document.recipe.crt.scanlines,
+                    0.0..=1.0,
+                );
+                changed |= slider(
+                    ui,
+                    "RGB bleed",
+                    &mut document.recipe.crt.rgb_bleed,
+                    0.0..=24.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Sync tearing",
+                    &mut document.recipe.crt.sync_tearing,
+                    0.0..=128.0,
+                );
+                changed |= slider(
+                    ui,
+                    "Phosphor mask",
+                    &mut document.recipe.crt.phosphor_mask,
+                    0.0..=1.0,
+                );
+                changed |= slider(ui, "Bloom", &mut document.recipe.crt.bloom, 0.0..=2.0);
+            });
+        });
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Surface").show(ui, |ui| {
+            changed |= slider(ui, "Grain", &mut document.recipe.grain.amount, 0.0..=0.8);
+            changed |= slider(
+                ui,
+                "Grain scale",
+                &mut document.recipe.grain.scale,
+                0.25..=12.0,
+            );
+            changed |=
+                randomizable_variation(ui, "Grain variation", &mut document.recipe.grain.seed);
+            changed |= slider(ui, "Paper", &mut document.recipe.paper.amount, 0.0..=0.5);
+            changed |= slider(
+                ui,
+                "Paper scale",
+                &mut document.recipe.paper.scale,
+                0.5..=24.0,
+            );
+            changed |= variation(ui, "Paper variation", &mut document.recipe.paper.seed);
+            control_row(ui, "Paper tone", |ui| {
+                changed |= ui
+                    .color_edit_button_rgb(&mut document.recipe.paper_color)
+                    .changed();
+            });
+        });
+        if changed {
+            document.recipe.transform = document.recipe.transform.normalized();
+        }
         changed
     }
 }
@@ -1587,31 +1846,45 @@ impl eframe::App for Editor {
                     self.open_in_new_tab = false;
                 }
                 "open-project" => self.open_project(&context),
-                "save-project" => self.save_project_as(),
+                "save-project" => {
+                    self.save_project();
+                }
+                "save-project-as" => {
+                    self.save_project_as();
+                }
                 "reload-source" => self.reload_source(&context),
                 "relink-source" => self.relink_source(&context),
                 "export" => self.inspector_tab = InspectorTab::Output,
                 "undo" => self.undo(&context),
                 "redo" => self.redo(&context),
                 "duplicate-tab" => self.duplicate_active_tab(),
-                "close-tab" => self.close_active_tab(),
+                "close-tab" => self.request_close_active_tab(),
+                "quit" => self.request_quit(&context),
                 "toggle-files" => self.library_open = !self.library_open,
                 "view-effect" => {
                     self.show_original = false;
                     self.show_comparison = false;
+                    self.show_split = false;
                 }
                 "view-original" => {
                     self.show_original = true;
                     self.show_comparison = false;
+                    self.show_split = false;
+                }
+                "view-split" => {
+                    self.show_original = false;
+                    self.show_comparison = false;
+                    self.show_split = true;
+                    self.plate_view = PlateView::Composite;
                 }
                 "view-snapshot" if self.comparison.is_some() => {
                     self.show_original = false;
                     self.show_comparison = true;
+                    self.show_split = false;
                 }
                 "view-fit" => self.scene_rect = egui::Rect::ZERO,
                 "view-actual-size" => {
-                    self.scene_rect =
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
+                    self.scene_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
                 }
                 "capture-snapshot" => {
                     self.comparison = self.preview.clone();
@@ -1623,6 +1896,12 @@ impl eframe::App for Editor {
                     self.status = "Comparison snapshot captured".into();
                 }
                 _ => {}
+            }
+        }
+        if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.pending_action.is_none() {
+                self.request_quit(&context);
             }
         }
         self.process_jobs(&context);
@@ -1652,7 +1931,7 @@ impl eframe::App for Editor {
                 ))
             })
         {
-            self.inspector_tab = InspectorTab::Output;
+            self.save_project();
         }
         if self.document.is_some()
             && context.input_mut(|input| {
@@ -1718,7 +1997,7 @@ impl eframe::App for Editor {
                                     let selected = index == self.active_tab;
                                     egui::Frame::new()
                                         .fill(if selected {
-                                            Color32::from_rgb(103, 31, 25)
+                                            Color32::from_rgb(52, 52, 52)
                                         } else {
                                             Color32::TRANSPARENT
                                         })
@@ -1751,13 +2030,64 @@ impl eframe::App for Editor {
                 if index != self.active_tab {
                     self.switch_tab(index);
                 }
-                self.close_active_tab();
+                self.request_close_active_tab();
             }
             if open_new_tab {
                 self.open_in_new_tab = true;
                 self.open(&context);
                 self.open_in_new_tab = false;
             }
+        }
+
+        if self.document.is_some() {
+            egui::Panel::top("view-controls")
+                .exact_size(38.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(10, 4))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(
+                                !self.show_original && !self.show_comparison && !self.show_split,
+                                "Edited",
+                            )
+                            .clicked()
+                        {
+                            self.show_original = false;
+                            self.show_comparison = false;
+                            self.show_split = false;
+                        }
+                        if ui
+                            .selectable_label(self.show_original, "Original")
+                            .clicked()
+                        {
+                            self.show_original = true;
+                            self.show_comparison = false;
+                            self.show_split = false;
+                        }
+                        if ui
+                            .selectable_label(self.show_split, "Before and after")
+                            .clicked()
+                        {
+                            self.show_original = false;
+                            self.show_comparison = false;
+                            self.show_split = true;
+                            self.plate_view = PlateView::Composite;
+                        }
+                        ui.separator();
+                        if ui.button("Fit").clicked() {
+                            self.scene_rect = egui::Rect::ZERO;
+                        }
+                        if ui.button("100%").clicked() {
+                            self.scene_rect =
+                                egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
+                        }
+                    });
+                });
         }
 
         let mut browser_open = None;
@@ -1775,7 +2105,7 @@ impl eframe::App for Editor {
             )
             .show_collapsible(ui, &mut library_open, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(section_label("LIBRARY"));
+                    ui.label(section_label("Library"));
                     if ui.small_button("Open folder…").clicked() {
                         browser_folder = Some(());
                     }
@@ -1808,7 +2138,7 @@ impl eframe::App for Editor {
                         });
                 });
                 ui.checkbox(&mut self.browser.watch, "Watch folder");
-                if ui.small_button("★ Favorite current folder").clicked()
+                if ui.small_button("Favorite current folder").clicked()
                     && let Some(folder) = self.browser.folder.clone()
                     && !self.persistent.favorite_folders.contains(&folder)
                 {
@@ -1817,7 +2147,7 @@ impl eframe::App for Editor {
                 for folder in &self.persistent.favorite_folders {
                     if ui
                         .small_button(format!(
-                            "★ {}",
+                            "{}",
                             folder.file_name().unwrap_or_default().to_string_lossy()
                         ))
                         .clicked()
@@ -1838,10 +2168,10 @@ impl eframe::App for Editor {
                     "Preserve recipe when replacing",
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("◀ Previous").clicked() {
+                    if ui.button("Previous").clicked() {
                         browser_open = Some(-1_isize);
                     }
-                    if ui.button("Next ▶").clicked() {
+                    if ui.button("Next").clicked() {
                         browser_open = Some(1_isize);
                     }
                 });
@@ -1936,12 +2266,13 @@ impl eframe::App for Editor {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.status).small().color(MUTED));
-                    if self.dirty {
-                        ui.label(RichText::new("UNSAVED").small().color(ACCENT));
+                    if self.is_dirty() {
+                        ui.label(RichText::new("Unsaved").small().color(ACCENT));
                     }
                 });
             });
 
+        let previous_export_settings = self.export_settings.clone();
         egui::Panel::right("controls")
             .default_size(340.0)
             .min_size(300.0)
@@ -1958,7 +2289,7 @@ impl eframe::App for Editor {
                     ui.selectable_value(
                         &mut self.inspector_tab,
                         InspectorTab::Plates,
-                        format!("Plates  {:02}", self.plate_previews.len()),
+                        format!("Plates ({})", self.plate_previews.len()),
                     );
                     ui.selectable_value(&mut self.inspector_tab, InspectorTab::Output, "Output");
                 });
@@ -1966,7 +2297,7 @@ impl eframe::App for Editor {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     if self.inspector_tab == InspectorTab::Plates {
-                        ui.label(section_label("⊕ PLATE DESK"));
+                        ui.label(section_label("Plate views"));
                         egui::CollapsingHeader::new("Plate inspector").show(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.plate_view,
@@ -1994,6 +2325,9 @@ impl eframe::App for Editor {
                                 });
                             }
                         });
+                        if self.plate_view != PlateView::Composite {
+                            self.show_split = false;
+                        }
                         egui::CollapsingHeader::new("Image information").show(ui, |ui| {
                             if let Some(document) = &self.document {
                                 let source = document.source();
@@ -2017,7 +2351,7 @@ impl eframe::App for Editor {
                                     source.info.metadata.iptc.len()
                                 ));
                                 ui.label(format!(
-                                    "Print: {:.2} × {:.2} in at {:.0} DPI",
+                                    "Print: {:.2} × {:.2} in at {:.0} dpi",
                                     source.width() as f32 / document.recipe.print.dpi,
                                     source.height() as f32 / document.recipe.print.dpi,
                                     document.recipe.print.dpi
@@ -2054,7 +2388,7 @@ impl eframe::App for Editor {
                         });
                     }
                     if self.inspector_tab == InspectorTab::Output {
-                        ui.label(section_label("OUTPUT"));
+                        ui.label(section_label("Output"));
                         egui::CollapsingHeader::new("Export manager")
                             .default_open(true)
                             .show(ui, |ui| {
@@ -2170,7 +2504,7 @@ impl eframe::App for Editor {
                         });
                     }
                     if self.inspector_tab == InspectorTab::Adjust {
-                        ui.label(section_label("RECIPE"));
+                        ui.label(section_label("Recipe"));
                         ui.horizontal(|ui| {
                             if ui.button("Save recipe…").clicked()
                                 && let Some(recipe) = self.document.as_ref().map(|d| &d.recipe)
@@ -2225,8 +2559,12 @@ impl eframe::App for Editor {
                     }
                 });
             });
+        if self.export_settings != previous_export_settings {
+            self.autosave_recovery();
+        }
         self.finish_edit(&context);
 
+        let mut split_fraction = self.split_fraction;
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(CANVAS).inner_margin(28.0))
             .show(ui, |ui| {
@@ -2250,6 +2588,10 @@ impl eframe::App for Editor {
                 };
                 if let Some(texture) = texture {
                     let size = texture.size_vec2();
+                    let split = self.show_split
+                        && self.plate_view == PlateView::Composite
+                        && self.original_preview.is_some()
+                        && self.preview.is_some();
                     egui::Scene::new()
                         .zoom_range(0.05..=16.0)
                         .max_inner_size(size)
@@ -2262,20 +2604,64 @@ impl eframe::App for Editor {
                                     color: Color32::from_black_alpha(180),
                                 })
                                 .show(ui, |ui| {
-                                    ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+                                    if split {
+                                        let original = self.original_preview.as_ref().unwrap();
+                                        let edited = self.preview.as_ref().unwrap();
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            size,
+                                            egui::Sense::click_and_drag(),
+                                        );
+                                        let uv = egui::Rect::from_min_max(
+                                            egui::Pos2::ZERO,
+                                            egui::Pos2::new(1.0, 1.0),
+                                        );
+                                        ui.painter().image(original.id(), rect, uv, Color32::WHITE);
+                                        let split_x = rect.left() + rect.width() * split_fraction;
+                                        let edited_clip = egui::Rect::from_min_max(
+                                            egui::Pos2::new(split_x, rect.top()),
+                                            rect.max,
+                                        );
+                                        ui.painter().with_clip_rect(edited_clip).image(
+                                            edited.id(),
+                                            rect,
+                                            uv,
+                                            Color32::WHITE,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::Pos2::new(split_x, rect.top()),
+                                                egui::Pos2::new(split_x, rect.bottom()),
+                                            ],
+                                            Stroke::new(2.0, Color32::WHITE),
+                                        );
+                                        if response.dragged()
+                                            && let Some(pointer) = response.interact_pointer_pos()
+                                        {
+                                            split_fraction = ((pointer.x - rect.left())
+                                                / rect.width())
+                                            .clamp(0.0, 1.0);
+                                        }
+                                        if response.hovered() {
+                                            ui.ctx().set_cursor_icon(
+                                                egui::CursorIcon::ResizeHorizontal,
+                                            );
+                                        }
+                                    } else {
+                                        ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+                                    }
                                 });
                         });
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                RichText::new("⊕  A PHOTOCOPY DARKROOM")
-                                    .size(28.0)
-                                    .family(FontFamily::Name(Arc::from("plex-heading")))
+                                RichText::new("Choose an image")
+                                    .size(24.0)
+                                    .family(FontFamily::Proportional)
                                     .color(PAPER),
                             );
                             ui.label(
-                                RichText::new("Non-destructive · high bit depth · native export")
+                                RichText::new("Edit without changing the source file.")
                                     .color(MUTED),
                             );
                             ui.add_space(16.0);
@@ -2286,9 +2672,16 @@ impl eframe::App for Editor {
                     });
                 }
             });
+        self.split_fraction = split_fraction;
 
-        if let Some(path) = self.pending_open.clone() {
-            egui::Window::new("Unsaved project")
+        if let Some(action) = self.pending_action.clone() {
+            let title = match &action {
+                PendingAction::Open(_) => "Replace unsaved project?",
+                PendingAction::CloseTab => "Close unsaved project?",
+                PendingAction::Quit => "Save before quitting?",
+            };
+            let mut decision = None;
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -2296,22 +2689,28 @@ impl eframe::App for Editor {
                     ui.label("The current document has unsaved changes.");
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            self.pending_open = None;
+                            decision = Some(0_u8);
                         }
                         if ui.button("Save project").clicked() {
-                            self.save_project_as();
-                            if !self.dirty {
-                                self.pending_open = None;
-                                self.open_path(path.clone(), &context);
-                            }
+                            decision = Some(1_u8);
                         }
-                        if ui.button("Discard and replace").clicked() {
-                            self.dirty = false;
-                            self.pending_open = None;
-                            self.open_path(path.clone(), &context);
+                        if ui.button("Discard changes").clicked() {
+                            decision = Some(2_u8);
                         }
                     });
                 });
+            match decision {
+                Some(0) => self.pending_action = None,
+                Some(1) if self.save_project() => {
+                    self.pending_action = None;
+                    self.continue_pending_action(action, false, &context);
+                }
+                Some(2) => {
+                    self.pending_action = None;
+                    self.continue_pending_action(action, true, &context);
+                }
+                _ => {}
+            }
         }
 
         if let Some(pending) = self.confirm.take() {
@@ -2351,7 +2750,7 @@ impl eframe::App for Editor {
         save_recipe(&self.recipe);
         self.persistent.default_export = self.export_settings.clone();
         self.save_persistent();
-        if self.dirty {
+        if self.is_dirty() {
             self.autosave_recovery();
         } else {
             let _ = fs::remove_file(recovery_path());
@@ -2915,6 +3314,22 @@ fn slider(
     .changed()
 }
 
+fn crop_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    control_row(ui, label, |ui| {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(value, range)
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+        )
+    })
+    .changed()
+}
+
 fn ink(ui: &mut egui::Ui, label: &str, ink: &mut Ink) -> bool {
     let mut changed = control_row(ui, label, |ui| {
         ui.color_edit_button_rgb(&mut ink.color).changed()
@@ -3008,9 +3423,9 @@ fn confirmed_options(error: &IoError, mut options: ExportOptions) -> Option<Expo
 
 fn section_label(text: &str) -> RichText {
     RichText::new(text)
-        .small()
-        .family(FontFamily::Name(Arc::from("plex-heading")))
-        .color(ACCENT)
+        .size(13.0)
+        .family(FontFamily::Proportional)
+        .color(PAPER)
 }
 
 fn rgb_color(color: [f32; 3]) -> Color32 {

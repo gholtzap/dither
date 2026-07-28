@@ -2,14 +2,14 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs::{self, File},
-    io::{BufReader, BufWriter, Cursor, Write},
+    io::{BufReader, BufWriter, Cursor, Seek, SeekFrom, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use dither_core::{
-    Document, Metadata, Pixel, RenderedImage, SourceImage, SourceInfo, linear_to_srgb,
+    Document, Metadata, Pixel, RenderError, SourceImage, SourceInfo, StoredImage, linear_to_srgb,
     srgb_to_linear,
 };
 use exr::{
@@ -244,17 +244,29 @@ pub fn export_cancellable(
     }
 
     let temporary = temporary_path(destination);
-    let result = write_export(document, &temporary, format);
+    let result = (|| {
+        let rendered = document
+            .render_stored(cancel, progress, |_, _, _, _, _| Ok(()))
+            .map_err(render_error)?;
+        write_stored_export(
+            source,
+            &rendered,
+            &temporary,
+            format,
+            document.recipe.print.dpi,
+            cancel,
+            progress,
+        )?;
+        check_cancel(cancel)?;
+        commit_export_set(
+            &[(temporary.clone(), destination.to_path_buf())],
+            options.overwrite,
+        )
+    })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
         return result;
     }
-    progress.store(85, Ordering::Relaxed);
-    if cancel.load(Ordering::Relaxed) {
-        let _ = fs::remove_file(&temporary);
-        return Err(IoError::Cancelled);
-    }
-    commit_export(&temporary, destination, options.overwrite)?;
     progress.store(100, Ordering::Relaxed);
     Ok(())
 }
@@ -288,83 +300,89 @@ pub fn export_with_plates_cancellable(
     let destination = destination.as_ref();
     preflight(source, destination, format, options)?;
     progress.store(5, Ordering::Relaxed);
-    if cancel.load(Ordering::Relaxed) {
-        return Err(IoError::Cancelled);
-    }
-    let rendered = document.render_document();
-    progress.store(70, Ordering::Relaxed);
-    if cancel.load(Ordering::Relaxed) {
-        return Err(IoError::Cancelled);
-    }
-    let plate_paths: Vec<_> = rendered
-        .plates
-        .iter()
-        .map(|plate| plate_path(destination, &plate.name))
-        .collect();
-    for path in &plate_paths {
-        preflight(source, path, ExportFormat::Png16, options)?;
-    }
-
     let composite_temporary = temporary_path(destination);
-    let plate_temporaries: Vec<_> = plate_paths
-        .iter()
-        .map(|path| temporary_path(path))
-        .collect();
+    let mut plate_outputs = Vec::new();
+    let mut target_error = None;
     let result = (|| {
-        write_rendered_export(
+        let rendered =
+            document.render_stored(cancel, progress, |name, _, width, height, coverage| {
+                let destination_path = plate_path(destination, name);
+                let duplicate = destination_path == destination
+                    || plate_outputs
+                        .iter()
+                        .any(|(_, path)| path == &destination_path);
+                if duplicate {
+                    let error = IoError::InvalidImage(format!(
+                        "more than one export output uses {}",
+                        destination_path.display()
+                    ));
+                    let message = error.to_string();
+                    target_error = Some(error);
+                    return Err(RenderError::Target(message));
+                }
+                if let Err(error) =
+                    preflight(source, &destination_path, ExportFormat::Png16, options)
+                {
+                    let message = error.to_string();
+                    target_error = Some(error);
+                    return Err(RenderError::Target(message));
+                }
+                let temporary = temporary_path(&destination_path);
+                plate_outputs.push((temporary.clone(), destination_path));
+                let result = File::create(&temporary)
+                    .map_err(IoError::from)
+                    .and_then(|file| {
+                        write_plate_png(
+                            source,
+                            coverage,
+                            width,
+                            height,
+                            document.recipe.print.dpi,
+                            BufWriter::new(CancellableWriter::new(file, cancel)),
+                            cancel,
+                        )
+                    });
+                if let Err(error) = result {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(RenderError::Cancelled);
+                    }
+                    let message = error.to_string();
+                    target_error = Some(error);
+                    return Err(RenderError::Target(message));
+                }
+                Ok(())
+            });
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(_) if target_error.is_some() => return Err(target_error.take().unwrap()),
+            Err(error) => return Err(render_error(error)),
+        };
+        write_stored_export(
             source,
-            &rendered.composite,
+            &rendered,
             &composite_temporary,
             format,
             document.recipe.print.dpi,
+            cancel,
+            progress,
         )?;
-        for ((plate, path), temporary) in rendered
-            .plates
-            .iter()
-            .zip(&plate_paths)
-            .zip(&plate_temporaries)
-        {
-            let file = BufWriter::new(File::create(temporary)?);
-            write_plate_png(
-                source,
-                plate.coverage(),
-                rendered.composite.width(),
-                rendered.composite.height(),
-                document.recipe.print.dpi,
-                file,
-            )?;
-            if path == destination {
-                return Err(IoError::InvalidImage(
-                    "plate output collides with the composite path".into(),
-                ));
-            }
-        }
-        Ok(())
+        check_cancel(cancel)?;
+        let outputs: Vec<_> =
+            std::iter::once((composite_temporary.clone(), destination.to_path_buf()))
+                .chain(plate_outputs.iter().cloned())
+                .collect();
+        commit_export_set(&outputs, options.overwrite)
     })();
     if let Err(error) = result {
-        let _ = fs::remove_file(&composite_temporary);
-        for path in &plate_temporaries {
-            let _ = fs::remove_file(path);
-        }
+        cleanup_temporaries(
+            std::iter::once(&composite_temporary)
+                .chain(plate_outputs.iter().map(|(temporary, _)| temporary)),
+        );
         return Err(error);
-    }
-
-    progress.store(90, Ordering::Relaxed);
-    if cancel.load(Ordering::Relaxed) {
-        let _ = fs::remove_file(&composite_temporary);
-        for path in &plate_temporaries {
-            let _ = fs::remove_file(path);
-        }
-        return Err(IoError::Cancelled);
-    }
-
-    commit_export(&composite_temporary, destination, options.overwrite)?;
-    for (temporary, destination) in plate_temporaries.iter().zip(&plate_paths) {
-        commit_export(temporary, destination, options.overwrite)?;
     }
     progress.store(100, Ordering::Relaxed);
     Ok(std::iter::once(destination.to_path_buf())
-        .chain(plate_paths)
+        .chain(plate_outputs.into_iter().map(|(_, path)| path))
         .collect())
 }
 
@@ -378,41 +396,37 @@ pub fn preflight(
     validate_export(source, format, options)
 }
 
-fn write_export(document: &Document, path: &Path, format: ExportFormat) -> Result<(), IoError> {
-    let rendered = document.render();
-    write_rendered_export(
-        document.source(),
-        &rendered,
-        path,
-        format,
-        document.recipe.print.dpi,
-    )
-}
-
-fn write_rendered_export(
+fn write_stored_export(
     source: &SourceImage,
-    rendered: &RenderedImage,
+    rendered: &StoredImage,
     path: &Path,
     format: ExportFormat,
     dpi: f32,
+    cancel: &AtomicBool,
+    progress: &AtomicU8,
 ) -> Result<(), IoError> {
     let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-    match format {
-        ExportFormat::Png16 => write_png(source, rendered, dpi, writer)?,
-        ExportFormat::Tiff16 => write_tiff(source, rendered, dpi, writer)?,
-        ExportFormat::OpenExr32 => write_exr(source, rendered, writer)?,
+    let writer = BufWriter::new(CancellableWriter::new(file, cancel));
+    let result = match format {
+        ExportFormat::Png16 => write_png(source, rendered, dpi, writer, cancel, progress),
+        ExportFormat::Tiff16 => write_tiff(source, rendered, dpi, writer, cancel, progress),
+        ExportFormat::OpenExr32 => write_exr(source, rendered, writer, progress),
+    };
+    if cancel.load(Ordering::Relaxed) && result.is_err() {
+        return Err(IoError::Cancelled);
     }
-    Ok(())
+    result
 }
 
 const EXPORT_ROWS: u32 = 256;
 
-fn write_png(
+fn write_png<W: Write>(
     source: &SourceImage,
-    rendered: &RenderedImage,
+    rendered: &StoredImage,
     dpi: f32,
-    writer: BufWriter<File>,
+    writer: W,
+    cancel: &AtomicBool,
+    progress: &AtomicU8,
 ) -> Result<(), IoError> {
     let pixel_encoder = PixelEncoder::new(&source.info.color_profile)?;
     let mut info = png::Info::with_size(rendered.width(), rendered.height());
@@ -421,7 +435,11 @@ fn write_png(
     info.pixel_dims = Some(pixel_dimensions(dpi));
     info.icc_profile = Some(Cow::Owned(pixel_encoder.profile.clone()));
     if !source.info.metadata.exif.is_empty() {
-        info.exif_metadata = Some(Cow::Owned(exif_blob(&source.info.metadata.exif)?));
+        info.exif_metadata = Some(Cow::Owned(exif_blob(
+            &source.info.metadata.exif,
+            rendered.width(),
+            rendered.height(),
+        )?));
     }
     if !source.info.metadata.xmp.is_empty() {
         info.utf8_text.push(png::text_metadata::ITXtChunk::new(
@@ -432,31 +450,43 @@ fn write_png(
     }
     let mut encoder = png::Encoder::with_info(writer, info)?;
     encoder.set_compression(png::Compression::High);
-    let mut writer = encoder.write_header()?.into_stream_writer()?;
-    for rows in rendered
+    let mut png = encoder.write_header()?;
+    let mut writer = png.stream_writer()?;
+    let chunks = rendered
         .pixels()
-        .chunks(EXPORT_ROWS as usize * rendered.width() as usize)
-    {
+        .chunks(EXPORT_ROWS as usize * rendered.width() as usize);
+    let chunk_count = chunks.len().max(1);
+    for (index, rows) in chunks.enumerate() {
+        check_cancel(cancel)?;
         writer.write_all(&u16_bytes(&pixel_encoder.encode(rows), u16::to_be_bytes))?;
+        progress.store(
+            75 + ((index + 1) * 20 / chunk_count) as u8,
+            Ordering::Relaxed,
+        );
     }
     writer.finish()?;
     Ok(())
 }
 
-fn write_plate_png(
+fn write_plate_png<W: Write>(
     source: &SourceImage,
     coverage: &[f32],
     width: u32,
     height: u32,
     dpi: f32,
-    writer: BufWriter<File>,
+    writer: W,
+    cancel: &AtomicBool,
 ) -> Result<(), IoError> {
     let mut info = png::Info::with_size(width, height);
     info.color_type = png::ColorType::Grayscale;
     info.bit_depth = png::BitDepth::Sixteen;
     info.pixel_dims = Some(pixel_dimensions(dpi));
     if !source.info.metadata.exif.is_empty() {
-        info.exif_metadata = Some(Cow::Owned(exif_blob(&source.info.metadata.exif)?));
+        info.exif_metadata = Some(Cow::Owned(exif_blob(
+            &source.info.metadata.exif,
+            width,
+            height,
+        )?));
     }
     if !source.info.metadata.xmp.is_empty() {
         info.utf8_text.push(png::text_metadata::ITXtChunk::new(
@@ -467,11 +497,17 @@ fn write_plate_png(
     }
     let mut encoder = png::Encoder::with_info(writer, info)?;
     encoder.set_compression(png::Compression::High);
-    let bytes: Vec<u8> = coverage
-        .iter()
-        .flat_map(|value| quantize(*value).to_be_bytes())
-        .collect();
-    encoder.write_header()?.write_image_data(&bytes)?;
+    let mut png = encoder.write_header()?;
+    let mut writer = png.stream_writer()?;
+    for rows in coverage.chunks(EXPORT_ROWS as usize * width as usize) {
+        check_cancel(cancel)?;
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|value| quantize(*value).to_be_bytes())
+            .collect();
+        writer.write_all(&bytes)?;
+    }
+    writer.finish()?;
     Ok(())
 }
 
@@ -539,18 +575,26 @@ fn validate_export(
     Ok(())
 }
 
-fn write_tiff(
+fn write_tiff<W: Write + Seek>(
     source: &SourceImage,
-    rendered: &RenderedImage,
+    rendered: &StoredImage,
     dpi: f32,
-    writer: BufWriter<File>,
+    writer: W,
+    cancel: &AtomicBool,
+    progress: &AtomicU8,
 ) -> Result<(), IoError> {
     let pixel_encoder = PixelEncoder::new(&source.info.color_profile)?;
     let mut tiff = TiffWriter::new(writer).map_err(tiff_error)?;
     let mut root = DirectoryWriter::new();
 
     if !source.info.metadata.exif.is_empty() {
-        add_exif_directories(&mut tiff, &mut root, &source.info.metadata.exif)?;
+        add_exif_directories(
+            &mut tiff,
+            &mut root,
+            &source.info.metadata.exif,
+            rendered.width(),
+            rendered.height(),
+        )?;
     }
     if !source.info.metadata.iptc.is_empty() {
         match decode_iptc(&source.info.metadata.iptc)? {
@@ -574,10 +618,12 @@ fn write_tiff(
     }
 
     let mut strips = Vec::new();
-    for rendered_rows in rendered
+    let chunks = rendered
         .pixels()
-        .chunks(EXPORT_ROWS as usize * rendered.width() as usize)
-    {
+        .chunks(EXPORT_ROWS as usize * rendered.width() as usize);
+    let chunk_count = chunks.len().max(1);
+    for (index, rendered_rows) in chunks.enumerate() {
+        check_cancel(cancel)?;
         let rows = rendered_rows.len() / rendered.width() as usize;
         let data: Vec<u16> = pixel_encoder
             .encode(rendered_rows)
@@ -588,6 +634,10 @@ fn write_tiff(
             .write_strips_lzw(&data, 4, Dim2::new(rendered.width() as usize, rows), rows)
             .map_err(tiff_error)?;
         strips.append(&mut strip);
+        progress.store(
+            75 + ((index + 1) * 20 / chunk_count) as u8,
+            Ordering::Relaxed,
+        );
     }
     let strip_offsets: Vec<u32> = strips.iter().map(|(offset, _)| *offset).collect();
     let strip_bytes: Vec<u32> = strips.iter().map(|(_, bytes)| *bytes).collect();
@@ -762,12 +812,16 @@ fn add_exif_directories<W: std::io::Write + std::io::Seek>(
     tiff: &mut TiffWriter<W>,
     root: &mut DirectoryWriter,
     bytes: &[u8],
+    width: u32,
+    height: u32,
 ) -> Result<(), IoError> {
     let archive = decode_exif(bytes)?;
     root.copy(archive.root.iter());
-    if !archive.exif.is_empty() {
+    if !archive.exif.is_empty() || width > 0 {
         let mut directory = DirectoryWriter::new();
         directory.copy(archive.exif.iter());
+        directory.add_tag(ExifTag::ExifImageWidth, width);
+        directory.add_tag(ExifTag::ExifImageHeight, height);
         if !archive.interop.is_empty() {
             let mut interop = DirectoryWriter::new();
             interop.copy(archive.interop.iter());
@@ -786,22 +840,23 @@ fn add_exif_directories<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-fn exif_blob(bytes: &[u8]) -> Result<Vec<u8>, IoError> {
+fn exif_blob(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, IoError> {
     let mut output = Vec::new();
     {
         let cursor = Cursor::new(&mut output);
         let mut tiff = TiffWriter::new(cursor).map_err(tiff_error)?;
         let mut root = DirectoryWriter::new();
-        add_exif_directories(&mut tiff, &mut root, bytes)?;
+        add_exif_directories(&mut tiff, &mut root, bytes, width, height)?;
         tiff.build(root).map_err(tiff_error)?;
     }
     Ok(output)
 }
 
-fn write_exr(
+fn write_exr<W: Write + Seek>(
     source: &SourceImage,
-    rendered: &RenderedImage,
-    writer: BufWriter<File>,
+    rendered: &StoredImage,
+    writer: W,
+    progress: &AtomicU8,
 ) -> Result<(), IoError> {
     let width = rendered.width() as usize;
     let mut attributes = LayerAttributes::named("Dither composite");
@@ -833,7 +888,12 @@ fn write_exr(
     );
     let mut image = Image::from_layer(layer);
     image.attributes.chromaticities = Some(srgb_chromaticities());
-    image.write().to_buffered(writer)?;
+    image
+        .write()
+        .on_progress(|value| {
+            progress.store(75 + (value * 20.0).round() as u8, Ordering::Relaxed);
+        })
+        .to_buffered(writer)?;
     Ok(())
 }
 
@@ -1044,43 +1104,145 @@ fn temporary_path(destination: &Path) -> PathBuf {
     ))
 }
 
-fn commit_export(temporary: &Path, destination: &Path, overwrite: bool) -> Result<(), IoError> {
+fn commit_export_set(outputs: &[(PathBuf, PathBuf)], overwrite: bool) -> Result<(), IoError> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
     if !overwrite {
-        if let Err(error) = fs::hard_link(temporary, destination) {
-            let _ = fs::remove_file(temporary);
-            return if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Err(IoError::DestinationExists)
-            } else {
-                Err(error.into())
-            };
+        let mut committed = Vec::new();
+        for (temporary, destination) in outputs {
+            if let Err(error) = fs::hard_link(temporary, destination) {
+                for path in committed {
+                    let _ = fs::remove_file(path);
+                }
+                return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Err(IoError::DestinationExists)
+                } else {
+                    Err(error.into())
+                };
+            }
+            committed.push(destination);
         }
-        fs::remove_file(temporary)?;
+        cleanup_temporaries(outputs.iter().map(|(temporary, _)| temporary));
         return Ok(());
     }
 
-    if !destination.exists() {
-        return fs::rename(temporary, destination).map_err(IoError::from);
+    let mut backups = Vec::with_capacity(outputs.len());
+    for (_, destination) in outputs {
+        if !destination.exists() {
+            backups.push((destination.clone(), None));
+            continue;
+        }
+        let mut backup = temporary_path(destination);
+        let mut name = backup.file_name().unwrap_or_default().to_os_string();
+        name.push(".backup");
+        backup.set_file_name(name);
+        if let Err(error) = fs::rename(destination, &backup) {
+            restore_backups(&backups)?;
+            return Err(error.into());
+        }
+        backups.push((destination.clone(), Some(backup)));
     }
 
-    let backup_base = temporary_path(destination);
-    let mut backup_name = backup_base.file_name().unwrap_or_default().to_os_string();
-    backup_name.push(".backup");
-    let backup = backup_base.with_file_name(backup_name);
-    fs::rename(destination, &backup)?;
-    if let Err(error) = fs::rename(temporary, destination) {
-        let restore = fs::rename(&backup, destination);
-        let _ = fs::remove_file(temporary);
-        return match restore {
-            Ok(()) => Err(error.into()),
-            Err(restore_error) => Err(std::io::Error::other(format!(
-                "export commit failed ({error}); original remains at {} because restore failed ({restore_error})",
-                backup.display()
-            ))
-            .into()),
-        };
+    let mut committed = Vec::new();
+    for (temporary, destination) in outputs {
+        if let Err(error) = fs::rename(temporary, destination) {
+            for path in &committed {
+                let _ = fs::remove_file(path);
+            }
+            restore_backups(&backups)?;
+            return Err(error.into());
+        }
+        committed.push(destination.clone());
     }
-    fs::remove_file(backup)?;
+    for (_, backup) in backups {
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+    }
     Ok(())
+}
+
+fn restore_backups(backups: &[(PathBuf, Option<PathBuf>)]) -> Result<(), IoError> {
+    let mut errors = Vec::new();
+    for (destination, backup) in backups.iter().rev() {
+        if let Some(backup) = backup
+            && let Err(error) = fs::rename(backup, destination)
+        {
+            errors.push(format!(
+                "{} could not be restored from {}: {error}",
+                destination.display(),
+                backup.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(IoError::InvalidImage(format!(
+            "export rollback failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+fn cleanup_temporaries<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn render_error(error: RenderError) -> IoError {
+    match error {
+        RenderError::Cancelled => IoError::Cancelled,
+        RenderError::Storage(error) | RenderError::Target(error) => IoError::InvalidImage(error),
+    }
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), IoError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(IoError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+struct CancellableWriter<'a> {
+    file: File,
+    cancel: &'a AtomicBool,
+}
+
+impl<'a> CancellableWriter<'a> {
+    fn new(file: File, cancel: &'a AtomicBool) -> Self {
+        Self { file, cancel }
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(std::io::Error::other("export cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Write for CancellableWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.file.flush()
+    }
+}
+
+impl Seek for CancellableWriter<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.file.seek(position)
+    }
 }
 
 fn format_name(format: ImageFormat) -> &'static str {
@@ -1220,9 +1382,10 @@ impl From<exr::error::Error> for IoError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dither_core::{Document, FourColor, Separation};
+    use dither_core::{Document, FourColor, PaletteSettings, Separation, Transform};
     use image::{ExtendedColorType, ImageEncoder};
     use lcms2::{CIExyY, ToneCurve};
+    use std::sync::Arc;
 
     #[test]
     fn lossless_raster_exports_preserve_dimensions_alpha_profile_and_xmp() {
@@ -1281,9 +1444,11 @@ mod tests {
         )
         .unwrap();
         let reopened_png = open(&exif_png_path).unwrap();
-        assert_eq!(
+        assert_exif_preserved_with_dimensions(
+            decode_exif(&source.info.metadata.exif).unwrap(),
             decode_exif(&reopened_png.info.metadata.exif).unwrap(),
-            decode_exif(&source.info.metadata.exif).unwrap()
+            2,
+            1,
         );
 
         source.info.metadata.iptc = normalize_iptc(vec![0x1c, 0x02, 0x05, 0x80, 0xff]);
@@ -1305,7 +1470,17 @@ mod tests {
         for (tag, value) in original_exif.root {
             assert_eq!(reopened_exif.root.get(&tag), Some(&value));
         }
-        assert_eq!(reopened_exif.exif, original_exif.exif);
+        for (tag, value) in original_exif.exif {
+            assert_eq!(reopened_exif.exif.get(&tag), Some(&value));
+        }
+        assert_eq!(
+            reopened_exif.exif.get(&(ExifTag::ExifImageWidth as u16)),
+            Some(&Value::Long(vec![2]))
+        );
+        assert_eq!(
+            reopened_exif.exif.get(&(ExifTag::ExifImageHeight as u16)),
+            Some(&Value::Long(vec![1]))
+        );
         assert_eq!(reopened_exif.gps, original_exif.gps);
         assert_eq!(reopened_exif.interop, original_exif.interop);
         assert_eq!(
@@ -1339,6 +1514,30 @@ mod tests {
         fs::remove_file(tiff_path).unwrap();
         fs::remove_file(exr_path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    fn assert_exif_preserved_with_dimensions(
+        original: ExifArchive,
+        actual: ExifArchive,
+        width: u32,
+        height: u32,
+    ) {
+        for (tag, value) in original.root {
+            assert_eq!(actual.root.get(&tag), Some(&value));
+        }
+        for (tag, value) in original.exif {
+            assert_eq!(actual.exif.get(&tag), Some(&value));
+        }
+        assert_eq!(
+            actual.exif.get(&(ExifTag::ExifImageWidth as u16)),
+            Some(&Value::Long(vec![width]))
+        );
+        assert_eq!(
+            actual.exif.get(&(ExifTag::ExifImageHeight as u16)),
+            Some(&Value::Long(vec![height]))
+        );
+        assert_eq!(actual.gps, original.gps);
+        assert_eq!(actual.interop, original.interop);
     }
 
     fn sample_exif() -> Vec<u8> {
@@ -1426,6 +1625,61 @@ mod tests {
 
         fs::remove_file(source_path).unwrap();
         fs::remove_file(destination).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn geometry_exports_full_resolution_with_updated_dimensions() {
+        let directory =
+            std::env::temp_dir().join(format!("dither-geometry-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.png");
+        let export_path = directory.join("geometry.tif");
+        let source_pixels = vec![32_000_u16; 8 * 4 * 4];
+        image::codecs::png::PngEncoder::new(File::create(&source_path).unwrap())
+            .write_image(
+                &source_pixels
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+                8,
+                4,
+                ExtendedColorType::Rgba16,
+            )
+            .unwrap();
+        let source_bytes = fs::read(&source_path).unwrap();
+        let mut source = open(&source_path).unwrap();
+        source.info.metadata.exif = sample_exif();
+        let mut document = Document::new(source);
+        document.recipe.transform = Transform {
+            crop: [0.125, 0.0, 0.875, 1.0],
+            quarter_turns: 1,
+            straighten_degrees: 2.0,
+        };
+
+        export(
+            &document,
+            &export_path,
+            ExportFormat::Tiff16,
+            ExportOptions::default(),
+        )
+        .unwrap();
+
+        let reopened = open(&export_path).unwrap();
+        assert_eq!((reopened.width(), reopened.height()), (4, 6));
+        let exif = decode_exif(&reopened.info.metadata.exif).unwrap();
+        assert_eq!(
+            exif.exif.get(&(ExifTag::ExifImageWidth as u16)),
+            Some(&Value::Long(vec![4]))
+        );
+        assert_eq!(
+            exif.exif.get(&(ExifTag::ExifImageHeight as u16)),
+            Some(&Value::Long(vec![6]))
+        );
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(export_path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 
@@ -1524,6 +1778,233 @@ mod tests {
     }
 
     #[test]
+    fn separated_export_commits_only_palette_plates_that_rendered() {
+        let directory = std::env::temp_dir().join(format!("dither-palette-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.test");
+        fs::write(&source_path, b"source placeholder").unwrap();
+        let source = SourceImage::new(
+            NonZeroU32::MIN,
+            NonZeroU32::MIN,
+            vec![[0.4, 0.5, 0.6, 1.0]],
+            SourceInfo {
+                path: source_path.clone(),
+                format: "test".into(),
+                bit_depth: 16,
+                color_profile: Profile::new_srgb().icc().unwrap(),
+                metadata: Metadata::default(),
+            },
+        )
+        .unwrap();
+        let mut document = Document::new(source);
+        let mut palette = PaletteSettings::default();
+        palette.colors.clear();
+        palette.size = 8;
+        document.recipe.separation = Separation::Indexed(palette);
+        let composite = directory.join("palette.tif");
+        let unused_plate = directory.join("palette-plate-index-08.png");
+        fs::write(&unused_plate, b"unrelated existing file").unwrap();
+
+        let paths = export_with_plates(
+            &document,
+            &composite,
+            ExportFormat::Tiff16,
+            ExportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(fs::read(&unused_plate).unwrap(), b"unrelated existing file");
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".dither-export")
+        }));
+
+        let blocked_composite = directory.join("blocked.tif");
+        let blocked_plate = directory.join("blocked-plate-index-01.png");
+        fs::write(&blocked_plate, b"existing plate").unwrap();
+        assert!(matches!(
+            export_with_plates(
+                &document,
+                &blocked_composite,
+                ExportFormat::Tiff16,
+                ExportOptions::default(),
+            ),
+            Err(IoError::DestinationExists)
+        ));
+        assert!(!blocked_composite.exists());
+        assert_eq!(fs::read(&blocked_plate).unwrap(), b"existing plate");
+
+        for path in paths {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_file(unused_plate).unwrap();
+        fs::remove_file(blocked_plate).unwrap();
+        fs::remove_file(source_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn export_set_commit_rolls_back_every_destination() {
+        let directory = std::env::temp_dir().join(format!("dither-atomic-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+
+        let first_temp = directory.join("first.temp");
+        let second_temp = directory.join("second.temp");
+        let first_destination = directory.join("first.out");
+        let missing_parent_destination = directory.join("missing/second.out");
+        fs::write(&first_temp, b"first new").unwrap();
+        fs::write(&second_temp, b"second new").unwrap();
+        assert!(
+            commit_export_set(
+                &[
+                    (first_temp.clone(), first_destination.clone()),
+                    (second_temp.clone(), missing_parent_destination),
+                ],
+                false,
+            )
+            .is_err()
+        );
+        assert!(!first_destination.exists());
+        assert!(first_temp.exists());
+        assert!(second_temp.exists());
+
+        let second_destination = directory.join("second.out");
+        fs::write(&first_destination, b"first original").unwrap();
+        fs::write(&second_destination, b"second original").unwrap();
+        fs::write(&first_temp, b"first replacement").unwrap();
+        fs::remove_file(&second_temp).unwrap();
+        assert!(
+            commit_export_set(
+                &[
+                    (first_temp.clone(), first_destination.clone()),
+                    (second_temp.clone(), second_destination.clone()),
+                ],
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&first_destination).unwrap(), b"first original");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second original");
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".backup")
+        }));
+
+        fs::remove_file(first_temp).ok();
+        fs::remove_file(first_destination).unwrap();
+        fs::remove_file(second_destination).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn cancellation_removes_all_temporary_outputs_and_preserves_source() {
+        let directory = std::env::temp_dir().join(format!("dither-cancel-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.test");
+        fs::write(&source_path, b"source bytes must stay unchanged").unwrap();
+        let source_bytes = fs::read(&source_path).unwrap();
+        let source = SourceImage::new(
+            NonZeroU32::new(512).unwrap(),
+            NonZeroU32::new(512).unwrap(),
+            vec![[0.4, 0.5, 0.6, 1.0]; 512 * 512],
+            SourceInfo {
+                path: source_path.clone(),
+                format: "test".into(),
+                bit_depth: 16,
+                color_profile: Profile::new_srgb().icc().unwrap(),
+                metadata: Metadata::default(),
+            },
+        )
+        .unwrap();
+        let document = Document::new(source);
+        let destination = directory.join("cancelled.tif");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU8::new(0));
+        let cancel_thread = cancel.clone();
+        let progress_thread = progress.clone();
+        let trigger = std::thread::spawn(move || {
+            while progress_thread.load(Ordering::Relaxed) < 15 {
+                std::thread::yield_now();
+            }
+            cancel_thread.store(true, Ordering::Relaxed);
+        });
+
+        let result = export_with_plates_cancellable(
+            &document,
+            &destination,
+            ExportFormat::Tiff16,
+            ExportOptions::default(),
+            &cancel,
+            &progress,
+        );
+        trigger.join().unwrap();
+
+        assert!(matches!(result, Err(IoError::Cancelled)));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".dither-export")
+        }));
+
+        fs::remove_file(source_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn encoder_cancellation_is_reported_as_cancellation() {
+        let directory =
+            std::env::temp_dir().join(format!("dither-encode-cancel-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("cancelled.exr");
+        let source = SourceImage::new(
+            NonZeroU32::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            vec![[0.4, 0.5, 0.6, 1.0]; 4],
+            SourceInfo {
+                path: directory.join("source.test"),
+                format: "test".into(),
+                bit_depth: 16,
+                color_profile: Profile::new_srgb().icc().unwrap(),
+                metadata: Metadata::default(),
+            },
+        )
+        .unwrap();
+        let document = Document::new(source);
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU8::new(0);
+        let rendered = document
+            .render_stored(&cancel, &progress, |_, _, _, _, _| Ok(()))
+            .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+
+        let result = write_stored_export(
+            document.source(),
+            &rendered,
+            &path,
+            ExportFormat::OpenExr32,
+            document.recipe.print.dpi,
+            &cancel,
+            &progress,
+        );
+
+        assert!(matches!(result, Err(IoError::Cancelled)));
+        fs::remove_file(path).ok();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn grayscale_icc_is_color_managed_into_the_rgb_working_space() {
         let directory = std::env::temp_dir().join(format!("dither-gray-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
@@ -1577,13 +2058,79 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set DITHER_RAW_SAMPLE to a real camera file"]
-    fn real_raw_sample_develops_at_camera_bit_depth() {
-        let source = open(std::env::var_os("DITHER_RAW_SAMPLE").unwrap()).unwrap();
+    fn standards_compliant_dng_develops_and_exports_with_camera_metadata() {
+        use rawler::{
+            CFA, RawImage,
+            cfa::PlaneColor,
+            decoders::Camera,
+            dng::{
+                CropMode, DNG_VERSION_V1_4, DngCompression, DngPhotometricConversion,
+                writer::DngWriter,
+            },
+            imgop::xyz::Illuminant,
+            pixarray::PixU16,
+            rawimage::{BlackLevel, CFAConfig, RawPhotometricInterpretation, WhiteLevel},
+        };
 
-        assert!(source.width() > 500);
-        assert!(source.height() > 500);
-        assert!(source.info.bit_depth >= 10);
+        let directory = std::env::temp_dir().join(format!("dither-dng-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let dng_path = directory.join("linear-raw.dng");
+        let width = 32_usize;
+        let height = 24_usize;
+        let pixels = (0..width * height)
+            .map(|index| 1024 + ((index * 83) % 60_000) as u16)
+            .collect::<Vec<_>>();
+        let cfa = CFA::new("RGGB");
+        let plane_color = PlaneColor::default();
+        let mut camera = Camera {
+            make: "Dither".into(),
+            model: "CFA RAW test".into(),
+            clean_make: "Dither".into(),
+            clean_model: "CFA RAW test".into(),
+            real_bps: 16,
+            cfa: cfa.clone(),
+            plane_color: plane_color.clone(),
+            ..Camera::default()
+        };
+        camera.color_matrix.insert(
+            Illuminant::D65,
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        );
+        let raw_image = RawImage::new(
+            camera,
+            PixU16::new_with(pixels, width, height),
+            1,
+            [2.0, 1.0, 1.5, f32::NAN],
+            RawPhotometricInterpretation::Cfa(CFAConfig::new(&cfa, &plane_color)),
+            Some(BlackLevel::new(&[1024_u32; 4], 2, 2, 1)),
+            Some(WhiteLevel::new_bits(16, 1)),
+            false,
+        );
+        let mut dng = DngWriter::new(
+            BufWriter::new(File::create(&dng_path).unwrap()),
+            DNG_VERSION_V1_4,
+        )
+        .unwrap();
+        let mut raw = dng.subframe_on_root(0);
+        raw.raw_image(
+            &raw_image,
+            CropMode::None,
+            DngCompression::Uncompressed,
+            DngPhotometricConversion::Original,
+            1,
+        )
+        .unwrap();
+        raw.finalize().unwrap();
+        dng.load_base_tags(&raw_image).unwrap();
+        dng.close().unwrap();
+
+        let source = open(&dng_path).unwrap();
+
+        assert_eq!(
+            (source.width(), source.height()),
+            (width as u32, height as u32)
+        );
+        assert_eq!(source.info.bit_depth, 16);
         assert!(!source.info.metadata.camera.is_empty());
         assert!(
             source
@@ -1592,9 +2139,8 @@ mod tests {
                 .all(|pixel| pixel.iter().all(|value| value.is_finite()))
         );
 
-        let output = std::env::temp_dir().join(format!("dither-raw-{}.exr", std::process::id()));
-        let tiff_output =
-            std::env::temp_dir().join(format!("dither-raw-{}.tif", std::process::id()));
+        let output = directory.join("linear-raw.exr");
+        let tiff_output = directory.join("linear-raw.tif");
         export(
             &Document::new(source.clone()),
             &tiff_output,
@@ -1628,5 +2174,7 @@ mod tests {
         assert!(!tiff_exif.exif.is_empty());
         fs::remove_file(output).unwrap();
         fs::remove_file(tiff_output).unwrap();
+        fs::remove_file(dng_path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

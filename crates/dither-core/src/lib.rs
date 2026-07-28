@@ -1,10 +1,18 @@
+mod storage;
+mod stored_render;
+
 use std::{
     num::NonZeroU32,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
+
+pub use stored_render::{RenderError, StoredImage};
 
 /// Linear-light, unassociated RGBA. RGB may be HDR; alpha is always in 0...1.
 pub type Pixel = [f32; 4];
@@ -214,6 +222,44 @@ pub enum Resampling {
     #[default]
     Bilinear,
     Supersample2x,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transform {
+    /// Normalized source bounds: left, top, right, bottom.
+    pub crop: [f32; 4],
+    /// Clockwise quarter turns in the range 0...3.
+    pub quarter_turns: u8,
+    pub straighten_degrees: f32,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            crop: [0.0, 0.0, 1.0, 1.0],
+            quarter_turns: 0,
+            straighten_degrees: 0.0,
+        }
+    }
+}
+
+impl Transform {
+    pub fn normalized(self) -> Self {
+        let left = self.crop[0].clamp(0.0, 0.99);
+        let top = self.crop[1].clamp(0.0, 0.99);
+        let right = self.crop[2].clamp(left + 0.01, 1.0);
+        let bottom = self.crop[3].clamp(top + 0.01, 1.0);
+        Self {
+            crop: [left, top, right, bottom],
+            quarter_turns: self.quarter_turns % 4,
+            straighten_degrees: self.straighten_degrees.clamp(-45.0, 45.0),
+        }
+    }
+
+    pub fn is_identity(self) -> bool {
+        self.normalized() == Self::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -562,6 +608,7 @@ pub struct Recipe {
     pub separation: Separation,
     pub dither: DitherSettings,
     pub resampling: Resampling,
+    pub transform: Transform,
     pub preprocess: Preprocess,
     pub print: PrintSettings,
     pub glow: Glow,
@@ -579,6 +626,7 @@ impl Default for Recipe {
             separation: Separation::default(),
             dither: DitherSettings::default(),
             resampling: Resampling::default(),
+            transform: Transform::default(),
             preprocess: Preprocess::default(),
             print: PrintSettings::default(),
             glow: Glow::default(),
@@ -756,54 +804,95 @@ impl Document {
         }
     }
 
+    pub fn output_dimensions(&self) -> (NonZeroU32, NonZeroU32) {
+        transformed_dimensions(&self.source, self.recipe.transform)
+    }
+
+    pub fn plate_names(&self) -> Vec<String> {
+        match &self.recipe.separation {
+            Separation::Monochrome(settings) => settings
+                .ink
+                .enabled
+                .then(|| "black".to_owned())
+                .into_iter()
+                .collect(),
+            Separation::ThreeColor(settings) => enabled_named_inks(&[
+                ("cyan", settings.cyan),
+                ("magenta", settings.magenta),
+                ("yellow", settings.yellow),
+            ]),
+            Separation::Rgb(settings) => enabled_named_inks(&[
+                ("red", settings.cyan),
+                ("green", settings.magenta),
+                ("blue", settings.yellow),
+            ]),
+            Separation::Cmyk(settings) => enabled_named_inks(&[
+                ("cyan", settings.cyan),
+                ("magenta", settings.magenta),
+                ("yellow", settings.yellow),
+                ("black", settings.black),
+            ]),
+            Separation::TriTone(settings) => enabled_named_inks(&[
+                ("shadows", settings.shadows.ink),
+                ("midtones", settings.midtones.ink),
+                ("highlights", settings.highlights.ink),
+            ]),
+            Separation::Tonal(settings) => palette_plate_names("tone", settings),
+            Separation::Indexed(settings) => palette_plate_names("index", settings),
+            Separation::Custom(settings) => palette_plate_names("color", settings),
+        }
+    }
+
     pub fn render(&self) -> RenderedImage {
-        self.render_document_to(self.source.width, self.source.height)
-            .composite
+        let (width, height) = self.output_dimensions();
+        self.render_document_to(width, height).composite
     }
 
     pub fn render_document(&self) -> RenderedDocument {
-        self.render_document_to(self.source.width, self.source.height)
+        let (width, height) = self.output_dimensions();
+        self.render_document_to(width, height)
     }
 
     pub fn render_preview(&self, max_dimension: NonZeroU32) -> RenderedImage {
-        let (width, height) = preview_dimensions(&self.source, max_dimension);
+        let (width, height) = preview_dimensions(self.output_dimensions(), max_dimension);
         self.render_document_to(width, height).composite
     }
 
     pub fn render_document_preview(&self, max_dimension: NonZeroU32) -> RenderedDocument {
-        let (width, height) = preview_dimensions(&self.source, max_dimension);
+        let (width, height) = preview_dimensions(self.output_dimensions(), max_dimension);
         self.render_document_to(width, height)
     }
 
     pub fn render_source_preview(&self, max_dimension: NonZeroU32) -> RenderedImage {
-        let (width, height) = preview_dimensions(&self.source, max_dimension);
-        let pixels = resample(&self.source, width.get() as usize, height.get() as usize);
+        let (width, height) = preview_dimensions(self.output_dimensions(), max_dimension);
+        let width_usize = width.get() as usize;
+        let height_usize = height.get() as usize;
+        let pixels = (0..height_usize)
+            .flat_map(|y| {
+                (0..width_usize).map(move |x| {
+                    self.sample_transformed(
+                        x as f32,
+                        y as f32,
+                        width_usize,
+                        height_usize,
+                        Resampling::Bilinear,
+                    )
+                })
+            })
+            .collect();
         RenderedImage::new(width, height, pixels)
     }
 
-    pub fn render_rows(&self, start_y: u32, row_count: NonZeroU32) -> Vec<Pixel> {
-        let rendered = self.render();
-        let end_y = start_y
-            .saturating_add(row_count.get())
-            .min(rendered.height());
-        if start_y >= end_y {
-            return Vec::new();
-        }
-        rendered.pixels[start_y as usize * rendered.width() as usize
-            ..end_y as usize * rendered.width() as usize]
-            .to_vec()
-    }
-
-    pub fn render_pixel_at(&self, x: u32, y: u32) -> Pixel {
-        let rendered = self.render();
-        rendered.pixels[y.min(rendered.height() - 1) as usize * rendered.width() as usize
-            + x.min(rendered.width() - 1) as usize]
-    }
-
     pub fn extract_palette(&self, count: u8) -> Vec<[f32; 3]> {
-        let width = self.source.width() as usize;
-        let height = self.source.height() as usize;
-        let mut pixels = resample(&self.source, width, height);
+        let (width, height) = self.output_dimensions();
+        let (width, height) = (width.get() as usize, height.get() as usize);
+        let mut pixels = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    self.sample_transformed(x as f32, y as f32, width, height, Resampling::Bilinear)
+                })
+            })
+            .collect::<Vec<_>>();
         preprocess(&mut pixels, width, height, self.recipe.preprocess);
         extract_palette(&pixels, count.clamp(2, 64) as usize)
     }
@@ -832,8 +921,9 @@ impl Document {
         }
         let width = output_width.get() as usize;
         let height = output_height.get() as usize;
-        let scale = (width as f32 / self.source.width() as f32)
-            .min(height as f32 / self.source.height() as f32);
+        let (full_width, full_height) = self.output_dimensions();
+        let scale =
+            (width as f32 / full_width.get() as f32).min(height as f32 / full_height.get() as f32);
         let mut pixels = self.resample_effects(width, height, scale);
         let mut preprocess_settings = self.recipe.preprocess;
         preprocess_settings.blur_radius *= scale;
@@ -853,13 +943,14 @@ impl Document {
             for (coverage, pixel) in plate.coverage.iter_mut().zip(&pixels) {
                 *coverage *= pixel[3];
             }
-            apply_distress(
+            let _ = apply_distress(
                 &mut plate.coverage,
                 width,
                 height,
                 self.assets.distress_mask.as_deref(),
                 self.recipe.displacement,
                 scale,
+                None,
             );
             let expansion = ((self.recipe.print.bleed_pixels as f32
                 + plate.ink.bleed_pixels as f32
@@ -889,8 +980,6 @@ impl Document {
     }
 
     fn resample_effects(&self, width: usize, height: usize, scale: f32) -> Vec<Pixel> {
-        let source_scale_x = self.source.width() as f32 / width as f32;
-        let source_scale_y = self.source.height() as f32 / height as f32;
         (0..height)
             .flat_map(|y| {
                 (0..width).map(move |x| {
@@ -941,32 +1030,27 @@ impl Document {
                             ox += tear * self.recipe.crt.sync_tearing * scale;
                         }
                     }
-                    let sx = (x as f32 + 0.5 + ox) * source_scale_x - 0.5;
-                    let sy = (y as f32 + 0.5 + oy) * source_scale_y - 0.5;
-                    let mut pixel = sample_source(
-                        &self.source,
-                        sx,
-                        sy,
-                        source_scale_x,
-                        source_scale_y,
+                    let mut pixel = self.sample_transformed(
+                        x as f32 + ox,
+                        y as f32 + oy,
+                        width,
+                        height,
                         self.recipe.resampling,
                     );
                     if self.recipe.crt.enabled && self.recipe.crt.rgb_bleed > 0.0 {
-                        let bleed = self.recipe.crt.rgb_bleed * scale * source_scale_x;
-                        pixel[0] = sample_source(
-                            &self.source,
-                            sx + bleed,
-                            sy,
-                            source_scale_x,
-                            source_scale_y,
+                        let bleed = self.recipe.crt.rgb_bleed * scale;
+                        pixel[0] = self.sample_transformed(
+                            x as f32 + ox + bleed,
+                            y as f32 + oy,
+                            width,
+                            height,
                             self.recipe.resampling,
                         )[0];
-                        pixel[2] = sample_source(
-                            &self.source,
-                            sx - bleed,
-                            sy,
-                            source_scale_x,
-                            source_scale_y,
+                        pixel[2] = self.sample_transformed(
+                            x as f32 + ox - bleed,
+                            y as f32 + oy,
+                            width,
+                            height,
                             self.recipe.resampling,
                         )[2];
                     }
@@ -974,6 +1058,36 @@ impl Document {
                 })
             })
             .collect()
+    }
+
+    fn sample_transformed(
+        &self,
+        x: f32,
+        y: f32,
+        width: usize,
+        height: usize,
+        resampling: Resampling,
+    ) -> Pixel {
+        let Some((source_x, source_y, source_scale_x, source_scale_y)) =
+            transformed_source_coordinates(
+                &self.source,
+                self.recipe.transform,
+                x,
+                y,
+                width,
+                height,
+            )
+        else {
+            return [0.0; 4];
+        };
+        sample_source(
+            &self.source,
+            source_x,
+            source_y,
+            source_scale_x,
+            source_scale_y,
+            resampling,
+        )
     }
 
     fn paper(&self, width: usize, height: usize) -> Vec<[f32; 3]> {
@@ -1176,14 +1290,14 @@ impl Document {
             ) * self.recipe.grain.amount;
             *value = (adjust_coverage(*value, threshold, softness) + grain).clamp(0.0, 1.0);
         }
-        dither_scalar(
+        let _ = dither_scalar(
             &mut values,
             width,
-            height,
             self.recipe.dither,
             self.scaled_print(width, height),
             ink.angle_degrees,
             plate,
+            None,
         );
         RenderedPlate {
             name: name.into(),
@@ -1259,13 +1373,33 @@ impl Document {
     }
 
     fn scaled_print(&self, width: usize, height: usize) -> PrintSettings {
-        let scale = (width as f32 / self.source.width() as f32)
-            .min(height as f32 / self.source.height() as f32);
+        let (full_width, full_height) = self.output_dimensions();
+        let scale =
+            (width as f32 / full_width.get() as f32).min(height as f32 / full_height.get() as f32);
         PrintSettings {
             dpi: self.recipe.print.dpi * scale,
             ..self.recipe.print
         }
     }
+}
+
+fn enabled_named_inks(inks: &[(&str, Ink)]) -> Vec<String> {
+    inks.iter()
+        .filter(|(_, ink)| ink.enabled)
+        .map(|(name, _)| (*name).to_owned())
+        .collect()
+}
+
+fn palette_plate_names(prefix: &str, settings: &PaletteSettings) -> Vec<String> {
+    let count = if settings.colors.len() >= 2 {
+        settings.colors.len().min(64)
+    } else {
+        settings.size.clamp(2, 64) as usize
+    };
+    (0..count)
+        .filter(|index| settings.inks.get(*index).is_none_or(|ink| ink.enabled))
+        .map(|index| format!("{prefix}-{:02}", index + 1))
+        .collect()
 }
 
 fn downsample_document(
@@ -1327,25 +1461,86 @@ fn valid_palette(colors: &[[f32; 3]]) -> Vec<[f32; 3]> {
     }
 }
 
-fn preview_dimensions(source: &SourceImage, max_dimension: NonZeroU32) -> (NonZeroU32, NonZeroU32) {
-    let scale = (max_dimension.get() as f32 / source.width().max(source.height()) as f32).min(1.0);
-    let width =
-        NonZeroU32::new((source.width() as f32 * scale).round() as u32).unwrap_or(NonZeroU32::MIN);
-    let height =
-        NonZeroU32::new((source.height() as f32 * scale).round() as u32).unwrap_or(NonZeroU32::MIN);
-    (width, height)
+fn transformed_dimensions(source: &SourceImage, transform: Transform) -> (NonZeroU32, NonZeroU32) {
+    let transform = transform.normalized();
+    let crop_width =
+        (source.width() as f32 * (transform.crop[2] - transform.crop[0])).round() as u32;
+    let crop_height =
+        (source.height() as f32 * (transform.crop[3] - transform.crop[1])).round() as u32;
+    let crop_width = NonZeroU32::new(crop_width).unwrap_or(NonZeroU32::MIN);
+    let crop_height = NonZeroU32::new(crop_height).unwrap_or(NonZeroU32::MIN);
+    if transform.quarter_turns.is_multiple_of(2) {
+        (crop_width, crop_height)
+    } else {
+        (crop_height, crop_width)
+    }
 }
 
-fn resample(source: &SourceImage, width: usize, height: usize) -> Vec<Pixel> {
-    let sx = source.width() as f32 / width as f32;
-    let sy = source.height() as f32 / height as f32;
-    (0..height)
-        .flat_map(|y| {
-            (0..width).map(move |x| {
-                source.sample((x as f32 + 0.5) * sx - 0.5, (y as f32 + 0.5) * sy - 0.5)
-            })
-        })
-        .collect()
+fn transformed_source_coordinates(
+    source: &SourceImage,
+    transform: Transform,
+    x: f32,
+    y: f32,
+    width: usize,
+    height: usize,
+) -> Option<(f32, f32, f32, f32)> {
+    let transform = transform.normalized();
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let center_x = x + 0.5 - width * 0.5;
+    let center_y = y + 0.5 - height * 0.5;
+    let radians = -transform.straighten_degrees.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let rotated_x = center_x * cos - center_y * sin;
+    let rotated_y = center_x * sin + center_y * cos;
+    let u = (rotated_x + width * 0.5) / width;
+    let v = (rotated_y + height * 0.5) / height;
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+        return None;
+    }
+    let (crop_u, crop_v) = match transform.quarter_turns {
+        0 => (u, v),
+        1 => (v, 1.0 - u),
+        2 => (1.0 - u, 1.0 - v),
+        3 => (1.0 - v, u),
+        _ => unreachable!(),
+    };
+    let crop_width = transform.crop[2] - transform.crop[0];
+    let crop_height = transform.crop[3] - transform.crop[1];
+    let source_u = transform.crop[0] + crop_u * crop_width;
+    let source_v = transform.crop[1] + crop_v * crop_height;
+    let source_x = source_u * source.width() as f32 - 0.5;
+    let source_y = source_v * source.height() as f32 - 0.5;
+    let oriented_source_width = if transform.quarter_turns.is_multiple_of(2) {
+        source.width() as f32 * crop_width
+    } else {
+        source.height() as f32 * crop_height
+    };
+    let oriented_source_height = if transform.quarter_turns.is_multiple_of(2) {
+        source.height() as f32 * crop_height
+    } else {
+        source.width() as f32 * crop_width
+    };
+    Some((
+        source_x,
+        source_y,
+        oriented_source_width / width,
+        oriented_source_height / height,
+    ))
+}
+
+fn preview_dimensions(
+    dimensions: (NonZeroU32, NonZeroU32),
+    max_dimension: NonZeroU32,
+) -> (NonZeroU32, NonZeroU32) {
+    let (source_width, source_height) = dimensions;
+    let scale =
+        (max_dimension.get() as f32 / source_width.get().max(source_height.get()) as f32).min(1.0);
+    let width = NonZeroU32::new((source_width.get() as f32 * scale).round() as u32)
+        .unwrap_or(NonZeroU32::MIN);
+    let height = NonZeroU32::new((source_height.get() as f32 * scale).round() as u32)
+        .unwrap_or(NonZeroU32::MIN);
+    (width, height)
 }
 
 fn sample_normalized(
@@ -1651,15 +1846,15 @@ fn adjust_coverage(value: f32, threshold: f32, softness: f32) -> f32 {
 fn dither_scalar(
     values: &mut [f32],
     width: usize,
-    height: usize,
     settings: DitherSettings,
     print: PrintSettings,
     angle: f32,
     plate: u64,
-) {
+    cancel: Option<&AtomicBool>,
+) -> bool {
+    let height = values.len() / width;
     if let Some(kernel) = diffusion_kernel(settings.algorithm) {
-        diffuse_scalar(values, width, height, kernel, settings.strength);
-        return;
+        return diffuse_scalar(values, width, height, kernel, settings.strength, cancel);
     }
     match settings.algorithm {
         DitherAlgorithm::Bayer { matrix_size } => {
@@ -1668,6 +1863,9 @@ fn dither_scalar(
                 _ => 8,
             };
             for y in 0..height {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
                 for x in 0..width {
                     let threshold =
                         (bayer_value(x % size, y % size, size) as f32 + 0.5) / (size * size) as f32;
@@ -1678,6 +1876,9 @@ fn dither_scalar(
         DitherAlgorithm::BlueNoise => {
             let map = blue_noise();
             for y in 0..height {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
                 for x in 0..width {
                     let offset = ((settings.seed.wrapping_add(plate) as usize) * 17) & 63;
                     let rank = map[((y + offset) & 63) * 64 + ((x + offset * 3) & 63)];
@@ -1688,6 +1889,9 @@ fn dither_scalar(
         }
         DitherAlgorithm::Modulation => {
             for y in 0..height {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
                 for x in 0..width {
                     let index = y * width + x;
                     let value = values[index].clamp(0.0, 1.0);
@@ -1703,6 +1907,9 @@ fn dither_scalar(
             let radians = angle.to_radians();
             let (sin, cos) = radians.sin_cos();
             for y in 0..height {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
                 for x in 0..width {
                     let rx = x as f32 * cos - y as f32 * sin;
                     let ry = x as f32 * sin + y as f32 * cos;
@@ -1728,6 +1935,7 @@ fn dither_scalar(
         | DitherAlgorithm::Burkes
         | DitherAlgorithm::JarvisJudiceNinke => unreachable!(),
     }
+    true
 }
 
 fn diffusion_kernel(algorithm: DitherAlgorithm) -> Option<&'static [(i32, i32, f32)]> {
@@ -1815,9 +2023,13 @@ fn diffuse_scalar(
     height: usize,
     kernel: &[(i32, i32, f32)],
     strength: f32,
-) {
+    cancel: Option<&AtomicBool>,
+) -> bool {
     let strength = strength.clamp(0.0, 1.0);
     for y in 0..height {
+        if render_cancelled(cancel, y) {
+            return false;
+        }
         for x in 0..width {
             let index = y * width + x;
             let old = values[index].clamp(0.0, 1.0);
@@ -1833,6 +2045,11 @@ fn diffuse_scalar(
             }
         }
     }
+    true
+}
+
+fn render_cancelled(cancel: Option<&AtomicBool>, row: usize) -> bool {
+    row.is_multiple_of(8) && cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
 }
 
 fn bayer_value(x: usize, y: usize, size: usize) -> usize {
@@ -2051,13 +2268,17 @@ fn apply_distress(
     mask: Option<&SourceImage>,
     settings: Displacement,
     render_scale: f32,
-) {
+    cancel: Option<&AtomicBool>,
+) -> bool {
     let amount = settings.distress_amount.clamp(0.0, 1.0);
     if amount == 0.0 || (settings.pattern == MapPattern::Imported && mask.is_none()) {
-        return;
+        return true;
     }
     let scale = (settings.pattern_scale * render_scale).max(0.5);
     for y in 0..height {
+        if render_cancelled(cancel, y) {
+            return false;
+        }
         for x in 0..width {
             let texture = if settings.pattern == MapPattern::Imported {
                 luminance(sample_normalized(mask.unwrap(), x, y, width, height))
@@ -2067,6 +2288,7 @@ fn apply_distress(
             coverage[y * width + x] *= 1.0 - amount * (1.0 - texture);
         }
     }
+    true
 }
 
 fn dilate(mask: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
@@ -2249,6 +2471,7 @@ fn random(x: i32, y: i32, seed: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
 
     fn source() -> SourceImage {
         SourceImage::new(
@@ -2403,15 +2626,118 @@ mod tests {
     }
 
     #[test]
-    fn preview_and_rows_preserve_dimensions_and_full_frame_diffusion() {
+    fn preview_preserves_dimensions() {
         let document = Document::new(source());
         let preview = document.render_preview(NonZeroU32::new(4).unwrap());
-        let rendered = document.render();
         assert_eq!((preview.width(), preview.height()), (4, 2));
+    }
+
+    fn assert_stored_render_matches(document: &Document) {
+        let expected = document.render_document();
+        let mut plates = Vec::new();
+        let stored = document
+            .render_stored(
+                &AtomicBool::new(false),
+                &AtomicU8::new(0),
+                |name, ink, width, height, coverage| {
+                    plates.push((name.to_owned(), ink, width, height, coverage.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert_eq!(
-            document.render_rows(1, NonZeroU32::MIN),
-            rendered.pixels()[8..16]
+            (stored.width(), stored.height()),
+            (expected.composite.width(), expected.composite.height())
         );
+        assert_eq!(
+            stored.scratch_byte_len(),
+            std::mem::size_of_val(stored.pixels())
+        );
+        for (actual, expected) in stored.pixels().iter().zip(expected.composite.pixels()) {
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
+            }
+        }
+        assert_eq!(plates.len(), expected.plates.len());
+        for ((name, ink, width, height, coverage), expected) in plates.iter().zip(&expected.plates)
+        {
+            assert_eq!(name, &expected.name);
+            assert_eq!(ink, &expected.ink);
+            assert_eq!((*width, *height), (stored.width(), stored.height()));
+            for (actual, expected) in coverage.iter().zip(expected.coverage()) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn stored_renderer_matches_all_presets_and_color_modes() {
+        for (_, recipe) in built_in_presets() {
+            let mut document = Document::new(source());
+            document.recipe = recipe.clone();
+            assert_stored_render_matches(&document);
+        }
+        for separation in [
+            Separation::Monochrome(Monochrome::default()),
+            Separation::ThreeColor(ThreeColor::default()),
+            Separation::Tonal(PaletteSettings::default()),
+            Separation::Indexed(PaletteSettings::default()),
+            Separation::Custom(PaletteSettings::default()),
+            Separation::Rgb(ThreeColor::default()),
+            Separation::Cmyk(FourColor::default()),
+            Separation::TriTone(TriTone::default()),
+        ] {
+            let mut document = Document::new(source());
+            document.recipe.separation = separation;
+            document.recipe.preprocess.blur_radius = 1.5;
+            document.recipe.preprocess.sharpen = 0.4;
+            document.recipe.preprocess.denoise = 0.3;
+            document.recipe.glow.enabled = true;
+            document.recipe.glow.radius = 2.0;
+            document.recipe.crt.enabled = true;
+            document.recipe.crt.bloom = 0.2;
+            document.recipe.crt.rgb_bleed = 1.0;
+            document.recipe.transform = Transform {
+                crop: [0.125, 0.0, 0.875, 1.0],
+                quarter_turns: 1,
+                straighten_degrees: 2.0,
+            };
+            assert_stored_render_matches(&document);
+        }
+    }
+
+    #[test]
+    fn stored_renderer_stops_before_writing_when_cancelled() {
+        let mut wrote_plate = false;
+        let result = Document::new(source()).render_stored(
+            &AtomicBool::new(true),
+            &AtomicU8::new(0),
+            |_, _, _, _, _| {
+                wrote_plate = true;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(RenderError::Cancelled)));
+        assert!(!wrote_plate);
+    }
+
+    #[test]
+    fn geometry_is_non_destructive_and_persists_in_recipe_json() {
+        let mut document = Document::new(source());
+        let original = document.source().clone();
+        document.recipe.transform = Transform {
+            crop: [0.25, 0.0, 0.75, 1.0],
+            quarter_turns: 1,
+            straighten_degrees: 3.5,
+        };
+        assert_eq!(
+            document.output_dimensions(),
+            (NonZeroU32::new(4).unwrap(), NonZeroU32::new(4).unwrap())
+        );
+        assert_eq!(document.source(), &original);
+        let bytes = serde_json::to_vec(&document.recipe).unwrap();
+        let restored: Recipe = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.transform, document.recipe.transform);
     }
 
     #[test]

@@ -20,10 +20,12 @@ The editor provides:
 
 - ordered, error-diffusion, blue-noise, modulation, and shape-based halftone dithering;
 - monochrome, tonal, indexed/custom-palette, RGB, CMY, CMYK, and tri-tone separations;
+- non-destructive crop, quarter-turn rotation, and straighten controls;
 - brightness, contrast, gamma, levels, blur, sharpen, denoise, and inversion controls;
 - print controls for DPI, LPI, bleed, trapping, ink colors, and individual plate setup;
 - optional paper texture, displacement, distress, glow, CRT, grain, and surface effects;
-- tabs, undo/redo, comparison snapshots, reusable recipe files, and recoverable projects;
+- tabs, undo/redo, a draggable before-and-after view, comparison snapshots, reusable
+  recipe files, and recoverable projects;
 - a folder browser with thumbnails, recent/favorite folders, watched-folder refresh, and
   batch export; and
 - lossless 16-bit PNG/TIFF or 32-bit OpenEXR export, with optional separate plate files.
@@ -33,6 +35,11 @@ shows the composite plus each grayscale mask and ink preview. The Output panel n
 and previews export destinations, renders from the original full-resolution image,
 tracks export history, and asks before any required metadata loss or bit-depth
 reduction.
+
+Full-resolution export uses file-backed working images. It can stop during rendering
+or encoding. A composite and its plate files commit as one set, so a failed export
+does not leave partial output. The app asks before it replaces or closes a project
+with unsaved changes.
 
 On macOS, run the development build with:
 
