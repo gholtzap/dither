@@ -43,6 +43,14 @@ impl SavedExportFormat {
             Self::OpenExr32 => "exr",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png16 => "PNG 16-bit",
+            Self::Tiff16 => "TIFF 16-bit",
+            Self::OpenExr32 => "OpenEXR 32-bit",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +279,8 @@ mod tests {
             project.export.destination(&project.source).unwrap(),
             PathBuf::from("/exports/print-source.tif")
         );
+        assert_eq!(SavedExportFormat::Png16.label(), "PNG 16-bit");
+        assert_eq!(SavedExportFormat::OpenExr32.label(), "OpenEXR 32-bit");
 
         let mut state = PersistentState::default();
         state.remember_file("one.tif".into());

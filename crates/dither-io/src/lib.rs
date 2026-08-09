@@ -45,6 +45,23 @@ pub enum ExportFormat {
     OpenExr32,
 }
 
+impl ExportFormat {
+    pub const fn bit_depth(self) -> u8 {
+        match self {
+            Self::Png16 | Self::Tiff16 => 16,
+            Self::OpenExr32 => 32,
+        }
+    }
+
+    pub const fn embeds_icc_profile(self) -> bool {
+        matches!(self, Self::Png16 | Self::Tiff16)
+    }
+
+    pub fn preserves_all_metadata(self, metadata: &Metadata) -> bool {
+        !matches!(self, Self::Png16) || (metadata.iptc.is_empty() && metadata.camera.is_empty())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExportOptions {
     pub overwrite: bool,
@@ -553,23 +570,14 @@ fn validate_export(
     format: ExportFormat,
     options: ExportOptions,
 ) -> Result<(), IoError> {
-    if source.info.bit_depth > 16
-        && format != ExportFormat::OpenExr32
-        && !options.allow_bit_depth_reduction
-    {
+    if source.info.bit_depth > format.bit_depth() && !options.allow_bit_depth_reduction {
         return Err(IoError::BitDepthReduction {
             source: source.info.bit_depth,
-            output: 16,
+            output: format.bit_depth(),
         });
     }
 
-    let metadata = &source.info.metadata;
-    let loses_metadata = match format {
-        ExportFormat::Png16 => !metadata.iptc.is_empty() || !metadata.camera.is_empty(),
-        ExportFormat::Tiff16 => false,
-        ExportFormat::OpenExr32 => false,
-    };
-    if loses_metadata && !options.allow_metadata_loss {
+    if !format.preserves_all_metadata(&source.info.metadata) && !options.allow_metadata_loss {
         return Err(IoError::MetadataLossRequiresConfirmation);
     }
     Ok(())
@@ -1386,6 +1394,21 @@ mod tests {
     use image::{ExtendedColorType, ImageEncoder};
     use lcms2::{CIExyY, ToneCurve};
     use std::sync::Arc;
+
+    #[test]
+    fn export_format_properties_match_validation_rules() {
+        let metadata = Metadata {
+            iptc: vec![1],
+            ..Metadata::default()
+        };
+        assert_eq!(ExportFormat::Png16.bit_depth(), 16);
+        assert_eq!(ExportFormat::OpenExr32.bit_depth(), 32);
+        assert!(ExportFormat::Tiff16.embeds_icc_profile());
+        assert!(!ExportFormat::OpenExr32.embeds_icc_profile());
+        assert!(!ExportFormat::Png16.preserves_all_metadata(&metadata));
+        assert!(ExportFormat::Tiff16.preserves_all_metadata(&metadata));
+        assert!(ExportFormat::OpenExr32.preserves_all_metadata(&metadata));
+    }
 
     #[test]
     fn lossless_raster_exports_preserve_dimensions_alpha_profile_and_xmp() {
