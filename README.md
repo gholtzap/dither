@@ -19,6 +19,7 @@ never overwritten.
 The editor provides:
 
 - ordered, error-diffusion, blue-noise, modulation, and shape-based halftone dithering;
+- pixelate, ASCII, dot-matrix, mosaic, brick, pointillist, heatmap, and outline effects;
 - monochrome, tonal, indexed/custom-palette, RGB, CMY, CMYK, and tri-tone separations;
 - non-destructive crop, quarter-turn rotation, and straighten controls;
 - brightness, contrast, gamma, levels, blur, sharpen, denoise, and inversion controls;

@@ -37,11 +37,11 @@
     }
   },
   "scripts": {
-    "build": "wasm-pack build ../../crates/dither-web --target web --release --out-dir ../../packages/dither-react/wasm --out-name dither_web",
+    "build": "wasm-pack build ../../crates/dither-web --target web --release --out-dir ../../packages/dither-react/wasm --out-name dither_web && node -e \"require('node:fs').rmSync('wasm/.gitignore',{force:true})\"",
     "sample": "python3 -m http.server 4173 --directory ../..",
     "test": "node --test",
     "typecheck": "tsc",
-    "prepublishOnly": "npm test && npm run typecheck"
+    "prepack": "npm run build && npm test && npm run typecheck"
   },
   "peerDependencies": {
     "react": ">=18"

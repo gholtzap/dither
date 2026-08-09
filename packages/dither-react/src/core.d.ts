@@ -22,6 +22,22 @@ export type DitherAlgorithm =
   | "clustered-dot";
 
 export type DitherPreset =
+  | "None"
+  | "Pixelate"
+  | "Dither"
+  | "ASCII"
+  | "Halftone"
+  | "CMYK"
+  | "Dot Matrix"
+  | "Risograph"
+  | "Mosaic"
+  | "Bricks"
+  | "Pointillism"
+  | "Heatmap"
+  | "Threshold"
+  | "Duotone"
+  | "Outline"
+  | "Posterize"
   | "Classic diffusion"
   | "Newspaper screen"
   | "Dry Xerox"
@@ -81,6 +97,7 @@ export type SeparationOptions =
     };
 
 export interface DitherRecipe {
+  bypass?: boolean;
   separation?: SeparationOptions;
   dither?: {
     algorithm?: DitherAlgorithm;
@@ -98,6 +115,21 @@ export interface DitherRecipe {
     whitePoint?: number;
     denoise?: number;
     invert?: boolean;
+  };
+  stylize?: {
+    effect?:
+      | "none"
+      | "pixelate"
+      | "ascii"
+      | "dot-matrix"
+      | "mosaic"
+      | "bricks"
+      | "pointillism"
+      | "heatmap"
+      | "outline";
+    cellSize?: number;
+    amount?: number;
+    seed?: number;
   };
   print?: {
     dpi?: number;

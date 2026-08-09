@@ -4,10 +4,10 @@ use std::{
 };
 
 use super::{
-    Document, FourColor, Ink, PaletteSettings, Pixel, Resampling, Separation, ThreeColor, ToneBand,
-    adjust_coverage, apply_distress, blend_pixels, composite_ink, diffusion_kernel, dither_scalar,
-    extract_palette, luminance, luminance3, nearest_color, nearest_two, noise, ordered_threshold,
-    smoothstep,
+    Document, FourColor, Ink, PaletteSettings, Pixel, Resampling, Separation, StylizeEffect,
+    ThreeColor, ToneBand, adjust_coverage, apply_distress, apply_stylize, blend_pixels,
+    composite_ink, diffusion_kernel, dither_scalar, extract_palette, luminance, luminance3,
+    nearest_color, nearest_two, noise, ordered_threshold, smoothstep,
 };
 use crate::storage::Scratch;
 
@@ -137,6 +137,14 @@ impl Document {
         let mut pixels = Scratch::<Pixel>::new(len)?;
         self.resample_stored(&mut pixels, width_usize, height_usize, scale, cancel)?;
         progress.store(15, Ordering::Relaxed);
+        if self.recipe.bypass {
+            progress.store(75, Ordering::Relaxed);
+            return Ok(StoredImage {
+                width,
+                height,
+                pixels,
+            });
+        }
 
         let preprocess_a = self.recipe.preprocess.denoise > 0.0
             || self.recipe.preprocess.blur_radius > 0.0
@@ -147,11 +155,13 @@ impl Document {
             && self.recipe.glow.intensity > 0.0
             && self.recipe.glow.radius > 0.0;
         let crt_work = self.recipe.crt.enabled && self.recipe.crt.bloom > 0.0;
-        let mut work_a = Scratch::<Pixel>::new(if preprocess_a || glow_work || crt_work {
-            len
-        } else {
-            1
-        })?;
+        let stylize_work = self.recipe.stylize.effect != StylizeEffect::None;
+        let mut work_a =
+            Scratch::<Pixel>::new(if preprocess_a || glow_work || crt_work || stylize_work {
+                len
+            } else {
+                1
+            })?;
         let mut work_b = Scratch::<Pixel>::new(if preprocess_b || glow_work || crt_work {
             len
         } else {
@@ -167,6 +177,19 @@ impl Document {
             scale,
             cancel,
         )?;
+        if stylize_work
+            && !apply_stylize(
+                &mut pixels,
+                &mut work_a,
+                width_usize,
+                height_usize,
+                self.recipe.stylize,
+                scale,
+                Some(cancel),
+            )
+        {
+            return Err(RenderError::Cancelled);
+        }
         apply_glow_stored(
             &mut pixels,
             &mut work_a,
@@ -403,7 +426,8 @@ impl Document {
             for x in 0..width {
                 let mut ox = 0.0;
                 let mut oy = 0.0;
-                if self.recipe.displacement.enabled
+                if !self.recipe.bypass
+                    && self.recipe.displacement.enabled
                     && let Some(sample) = super::displacement_sample(
                         self.assets.displacement_map.as_deref(),
                         x,
@@ -417,7 +441,7 @@ impl Document {
                     ox += (sample[0] * 2.0 - 1.0) * self.recipe.displacement.x_strength * scale;
                     oy += (sample[1] * 2.0 - 1.0) * self.recipe.displacement.y_strength * scale;
                 }
-                if self.recipe.crt.enabled {
+                if !self.recipe.bypass && self.recipe.crt.enabled {
                     let phase = y as f32 / height.max(1) as f32
                         * self.recipe.crt.wave_frequency
                         * std::f32::consts::TAU;
@@ -454,7 +478,8 @@ impl Document {
                     height,
                     self.recipe.resampling,
                 );
-                if self.recipe.crt.enabled && self.recipe.crt.rgb_bleed > 0.0 {
+                if !self.recipe.bypass && self.recipe.crt.enabled && self.recipe.crt.rgb_bleed > 0.0
+                {
                     let bleed = self.recipe.crt.rgb_bleed * scale;
                     pixel[0] = self.sample_transformed(
                         x as f32 + ox + bleed,

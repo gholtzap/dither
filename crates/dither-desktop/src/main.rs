@@ -17,7 +17,7 @@ use std::{
 use dither_core::{
     AssetKind, CrtPhase, DitherAlgorithm, Document, FourColor, HalftoneShape, Ink, MapPattern,
     Monochrome, PaletteSettings, Recipe, RenderedDocument, RenderedImage, Resampling, Separation,
-    ThreeColor, ToneBand, TriTone, built_in_presets,
+    StylizeEffect, ThreeColor, ToneBand, TriTone, built_in_presets,
 };
 use dither_io::{ExportFormat, ExportOptions, IoError};
 use eframe::egui::{
@@ -1495,6 +1495,40 @@ impl Editor {
                 changed = true;
             }
         });
+        changed |= ui
+            .checkbox(&mut document.recipe.bypass, "Show original only")
+            .changed();
+        if stylize_selector(ui, &mut document.recipe.stylize.effect) {
+            document.recipe.bypass = false;
+            changed = true;
+        }
+        if document.recipe.stylize.effect != StylizeEffect::None {
+            if !matches!(
+                document.recipe.stylize.effect,
+                StylizeEffect::Heatmap | StylizeEffect::Outline
+            ) {
+                changed |= slider(
+                    ui,
+                    "Effect size",
+                    &mut document.recipe.stylize.cell_size,
+                    4.0..=96.0,
+                );
+            }
+            if matches!(
+                document.recipe.stylize.effect,
+                StylizeEffect::DotMatrix | StylizeEffect::Pointillism | StylizeEffect::Outline
+            ) {
+                changed |= slider(
+                    ui,
+                    "Effect amount",
+                    &mut document.recipe.stylize.amount,
+                    0.0..=2.0,
+                );
+            }
+            if document.recipe.stylize.effect == StylizeEffect::Pointillism {
+                changed |= variation(ui, "Effect seed", &mut document.recipe.stylize.seed);
+            }
+        }
         changed |= algorithm_selector(ui, &mut document.recipe.dither.algorithm);
         changed |= resampling_selector(ui, &mut document.recipe.resampling);
         changed |= slider(
@@ -2858,6 +2892,45 @@ fn load_recipe_assets(document: &mut Document) -> Vec<String> {
         }
     }
     errors
+}
+
+fn stylize_selector(ui: &mut egui::Ui, effect: &mut StylizeEffect) -> bool {
+    let previous = *effect;
+    control_row(ui, "Effect", |ui| {
+        egui::ComboBox::from_id_salt("stylize-effect")
+            .width(ui.available_width())
+            .selected_text(stylize_name(*effect))
+            .show_ui(ui, |ui| {
+                for value in [
+                    StylizeEffect::None,
+                    StylizeEffect::Pixelate,
+                    StylizeEffect::Ascii,
+                    StylizeEffect::DotMatrix,
+                    StylizeEffect::Mosaic,
+                    StylizeEffect::Bricks,
+                    StylizeEffect::Pointillism,
+                    StylizeEffect::Heatmap,
+                    StylizeEffect::Outline,
+                ] {
+                    ui.selectable_value(effect, value, stylize_name(value));
+                }
+            });
+    });
+    *effect != previous
+}
+
+fn stylize_name(effect: StylizeEffect) -> &'static str {
+    match effect {
+        StylizeEffect::None => "None",
+        StylizeEffect::Pixelate => "Pixelate",
+        StylizeEffect::Ascii => "ASCII",
+        StylizeEffect::DotMatrix => "Dot matrix",
+        StylizeEffect::Mosaic => "Mosaic",
+        StylizeEffect::Bricks => "Bricks",
+        StylizeEffect::Pointillism => "Pointillism",
+        StylizeEffect::Heatmap => "Heatmap",
+        StylizeEffect::Outline => "Outline",
+    }
 }
 
 fn algorithm_selector(ui: &mut egui::Ui, algorithm: &mut DitherAlgorithm) -> bool {
