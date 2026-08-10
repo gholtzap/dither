@@ -43,7 +43,8 @@ const PANEL_RAISED: Color32 = Color32::from_rgb(29, 29, 29);
 const BORDER: Color32 = Color32::from_rgb(42, 42, 42);
 const PAPER: Color32 = Color32::from_rgb(232, 232, 232);
 const MUTED: Color32 = Color32::from_rgb(140, 140, 140);
-const ACCENT: Color32 = Color32::from_rgb(93, 93, 93);
+const ACCENT: Color32 = Color32::from_rgb(46, 83, 128);
+const ACCENT_TEXT: Color32 = Color32::from_rgb(126, 177, 235);
 
 #[cfg(target_os = "macos")]
 fn install_native_menu() -> muda::Result<Menu> {
@@ -410,6 +411,7 @@ impl Editor {
         style.visuals.widgets.active.bg_fill = ACCENT;
         style.visuals.selection.bg_fill = ACCENT;
         style.visuals.selection.stroke.color = PAPER;
+        style.visuals.hyperlink_color = ACCENT_TEXT;
         style.animation_time = 0.14;
         style.text_styles.insert(
             TextStyle::Heading,
@@ -1152,6 +1154,30 @@ impl Editor {
             .is_some_and(|(project, state)| state.is_dirty(&project))
     }
 
+    fn tab_is_dirty(&self, index: usize) -> bool {
+        if index == self.active_tab {
+            self.is_dirty()
+        } else {
+            self.tabs
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(SavedTab::is_dirty)
+        }
+    }
+
+    fn tab_path(&self, index: usize) -> Option<&Path> {
+        if index == self.active_tab {
+            self.document
+                .as_ref()
+                .map(|document| document.source().info.path.as_path())
+        } else {
+            self.tabs
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|tab| tab.document.source().info.path.as_path())
+        }
+    }
+
     fn discard_current_changes(&mut self) {
         if let Some(project) = self.current_project()
             && let Some(state) = &mut self.project_state
@@ -1447,51 +1473,12 @@ impl Editor {
         };
         let mut changed = false;
 
-        egui::CollapsingHeader::new("Geometry")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Rotate left").clicked() {
-                        document.recipe.transform.quarter_turns =
-                            (document.recipe.transform.quarter_turns + 3) % 4;
-                        changed = true;
-                    }
-                    if ui.button("Rotate right").clicked() {
-                        document.recipe.transform.quarter_turns =
-                            (document.recipe.transform.quarter_turns + 1) % 4;
-                        changed = true;
-                    }
-                    if ui.button("Reset geometry").clicked() {
-                        document.recipe.transform = dither_core::Transform::default();
-                        changed = true;
-                    }
-                });
-                changed |= slider(
-                    ui,
-                    "Straighten",
-                    &mut document.recipe.transform.straighten_degrees,
-                    -45.0..=45.0,
-                );
-                let [mut left, mut top, mut right, mut bottom] = document.recipe.transform.crop;
-                changed |= crop_slider(ui, "Crop left", &mut left, 0.0..=right - 0.01);
-                changed |= crop_slider(ui, "Crop top", &mut top, 0.0..=bottom - 0.01);
-                changed |= crop_slider(ui, "Crop right", &mut right, left + 0.01..=1.0);
-                changed |= crop_slider(ui, "Crop bottom", &mut bottom, top + 0.01..=1.0);
-                document.recipe.transform.crop = [left, top, right, bottom];
-                let (width, height) = document.output_dimensions();
-                ui.label(
-                    RichText::new(format!("Output size: {} × {} pixels", width, height))
-                        .small()
-                        .color(MUTED),
-                );
-            });
-        ui.add_space(8.0);
-
         ui.horizontal(|ui| {
             ui.label(section_label("Dither"));
-            if ui.small_button("Reset all").clicked() {
-                document.recipe = Recipe::default();
-                let _ = load_recipe_assets(document);
+            if ui.small_button("Reset").clicked() {
+                let defaults = Recipe::default();
+                document.recipe.dither = defaults.dither;
+                document.recipe.resampling = defaults.resampling;
                 changed = true;
             }
         });
@@ -1520,7 +1507,13 @@ impl Editor {
         });
 
         ui.add_space(18.0);
-        ui.label(section_label("Tone"));
+        ui.horizontal(|ui| {
+            ui.label(section_label("Tone"));
+            if ui.small_button("Reset").clicked() {
+                document.recipe.preprocess = Recipe::default().preprocess;
+                changed = true;
+            }
+        });
         changed |= slider(
             ui,
             "Brightness",
@@ -1627,6 +1620,44 @@ impl Editor {
         }
 
         ui.add_space(12.0);
+        egui::CollapsingHeader::new("Geometry").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Rotate left").clicked() {
+                    document.recipe.transform.quarter_turns =
+                        (document.recipe.transform.quarter_turns + 3) % 4;
+                    changed = true;
+                }
+                if ui.button("Rotate right").clicked() {
+                    document.recipe.transform.quarter_turns =
+                        (document.recipe.transform.quarter_turns + 1) % 4;
+                    changed = true;
+                }
+                if ui.button("Reset").clicked() {
+                    document.recipe.transform = dither_core::Transform::default();
+                    changed = true;
+                }
+            });
+            changed |= slider(
+                ui,
+                "Straighten",
+                &mut document.recipe.transform.straighten_degrees,
+                -45.0..=45.0,
+            );
+            let [mut left, mut top, mut right, mut bottom] = document.recipe.transform.crop;
+            changed |= crop_slider(ui, "Crop left", &mut left, 0.0..=right - 0.01);
+            changed |= crop_slider(ui, "Crop top", &mut top, 0.0..=bottom - 0.01);
+            changed |= crop_slider(ui, "Crop right", &mut right, left + 0.01..=1.0);
+            changed |= crop_slider(ui, "Crop bottom", &mut bottom, top + 0.01..=1.0);
+            document.recipe.transform.crop = [left, top, right, bottom];
+            let (width, height) = document.output_dimensions();
+            ui.label(
+                RichText::new(format!("Output size: {width} × {height} pixels"))
+                    .small()
+                    .color(MUTED),
+            );
+        });
+
+        ui.add_space(6.0);
         egui::CollapsingHeader::new("Print setup").show(ui, |ui| {
             changed |= slider(
                 ui,
@@ -1983,6 +2014,18 @@ impl eframe::App for Editor {
             let mut switch_to = None;
             let mut close_tab = None;
             let mut open_new_tab = false;
+            let tabs: Vec<_> = self
+                .tab_labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    let dirty = self.tab_is_dirty(index);
+                    let tooltip = self
+                        .tab_path(index)
+                        .map_or_else(|| label.clone(), |path| path.display().to_string());
+                    (tab_label(label, dirty), tooltip, dirty)
+                })
+                .collect();
             egui::Panel::top("document-tabs")
                 .exact_size(32.0)
                 .frame(egui::Frame::new().fill(Color32::from_rgb(20, 20, 18)))
@@ -1993,7 +2036,7 @@ impl eframe::App for Editor {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for (index, label) in self.tab_labels.iter().enumerate() {
+                                for (index, (label, tooltip, dirty)) in tabs.iter().enumerate() {
                                     let selected = index == self.active_tab;
                                     egui::Frame::new()
                                         .fill(if selected {
@@ -2004,10 +2047,23 @@ impl eframe::App for Editor {
                                         .inner_margin(egui::Margin::symmetric(8, 2))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
-                                                if ui.selectable_label(selected, label).clicked() {
+                                                let tooltip = if *dirty {
+                                                    format!("{tooltip}\nUnsaved changes")
+                                                } else {
+                                                    tooltip.clone()
+                                                };
+                                                if ui
+                                                    .selectable_label(selected, label)
+                                                    .on_hover_text(tooltip)
+                                                    .clicked()
+                                                {
                                                     switch_to = Some(index);
                                                 }
-                                                if ui.small_button("×").clicked() {
+                                                if ui
+                                                    .small_button("×")
+                                                    .on_hover_text("Close tab")
+                                                    .clicked()
+                                                {
                                                     close_tab = Some(index);
                                                 }
                                             });
@@ -2039,17 +2095,25 @@ impl eframe::App for Editor {
             }
         }
 
-        if self.document.is_some() {
-            egui::Panel::top("view-controls")
-                .exact_size(38.0)
-                .frame(
-                    egui::Frame::new()
-                        .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(10, 4))
-                        .stroke(Stroke::new(1.0, BORDER)),
-                )
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+        egui::Panel::top("view-controls")
+            .exact_size(38.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.library_open, "Files")
+                        .on_hover_text("Show or hide the image library")
+                        .clicked()
+                    {
+                        self.library_open = !self.library_open;
+                    }
+                    if self.document.is_some() {
+                        ui.separator();
                         if ui
                             .selectable_label(
                                 !self.show_original && !self.show_comparison && !self.show_split,
@@ -2086,9 +2150,19 @@ impl eframe::App for Editor {
                             self.scene_rect =
                                 egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1.0));
                         }
-                    });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Preview up to {} px · export uses the original",
+                                    PREVIEW_SIZE
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                        });
+                    }
                 });
-        }
+            });
 
         let mut browser_open = None;
         let mut browser_folder = None;
@@ -2267,7 +2341,7 @@ impl eframe::App for Editor {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.status).small().color(MUTED));
                     if self.is_dirty() {
-                        ui.label(RichText::new("Unsaved").small().color(ACCENT));
+                        ui.label(RichText::new("Unsaved").small().color(ACCENT_TEXT));
                     }
                 });
             });
@@ -2403,7 +2477,7 @@ impl eframe::App for Editor {
                                 control_row(ui, "Format", |ui| {
                                     egui::ComboBox::from_id_salt("export-format")
                                         .width(ui.available_width())
-                                        .selected_text(format!("{:?}", self.export_settings.format))
+                                        .selected_text(self.export_settings.format.label())
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(
                                                 &mut self.export_settings.format,
@@ -2427,26 +2501,37 @@ impl eframe::App for Editor {
                                     self.export_settings.directory =
                                         FileDialog::new().pick_folder();
                                 }
-                                if let Some(document) = &self.document
-                                    && let Some(destination) = self
+                                if let Some(document) = &self.document {
+                                    ui.add_space(8.0);
+                                    export_details(
+                                        ui,
+                                        document,
+                                        self.export_settings.format.into(),
+                                    );
+                                    if let Some(destination) = self
                                         .export_settings
                                         .destination(&document.source().info.path)
-                                {
-                                    ui.label(format!("Will create: {}", destination.display()));
-                                    for plate in &self.plate_previews {
-                                        if self.export_settings.plates {
-                                            ui.label(format!("  + plate {}.png", plate.name));
-                                        }
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            !self.exporting,
-                                            egui::Button::new("Export full-resolution")
-                                                .fill(ACCENT),
-                                        )
-                                        .clicked()
                                     {
-                                        self.run_configured_export();
+                                        ui.add_space(8.0);
+                                        ui.label(format!("Will create: {}", destination.display()));
+                                        for plate in &self.plate_previews {
+                                            if self.export_settings.plates {
+                                                ui.label(format!("  + plate {}.png", plate.name));
+                                            }
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.exporting,
+                                                egui::Button::new(
+                                                    RichText::new("Export full-resolution")
+                                                        .color(PAPER),
+                                                )
+                                                .fill(ACCENT),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.run_configured_export();
+                                        }
                                     }
                                 }
                                 if self.exporting {
@@ -2504,8 +2589,7 @@ impl eframe::App for Editor {
                         });
                     }
                     if self.inspector_tab == InspectorTab::Adjust {
-                        ui.label(section_label("Recipe"));
-                        ui.horizontal(|ui| {
+                        ui.menu_button("Recipe", |ui| {
                             if ui.button("Save recipe…").clicked()
                                 && let Some(recipe) = self.document.as_ref().map(|d| &d.recipe)
                             {
@@ -2518,6 +2602,7 @@ impl eframe::App for Editor {
                                         self.status = format!("Recipe save failed: {error}")
                                     }
                                 }
+                                ui.close();
                             }
                             if ui.button("Load recipe…").clicked() {
                                 match load_recipe_as() {
@@ -2544,9 +2629,10 @@ impl eframe::App for Editor {
                                         self.status = format!("Recipe load failed: {error}")
                                     }
                                 }
+                                ui.close();
                             }
                         });
-                        ui.add_space(18.0);
+                        ui.add_space(10.0);
                         let previous = self
                             .document
                             .as_ref()
@@ -3428,6 +3514,48 @@ fn section_label(text: &str) -> RichText {
         .color(PAPER)
 }
 
+fn export_details(ui: &mut egui::Ui, document: &Document, format: ExportFormat) {
+    let source = document.source();
+    let (width, height) = document.output_dimensions();
+    ui.label(RichText::new("Full-resolution output").color(PAPER));
+    ui.label(
+        RichText::new(format!(
+            "{width} × {height} pixels · {}-bit · alpha retained",
+            format.bit_depth()
+        ))
+        .small()
+        .color(MUTED),
+    );
+    ui.label(
+        RichText::new(if format.embeds_icc_profile() {
+            "Color: managed ICC profile embedded"
+        } else {
+            "Color: linear sRGB chromaticities"
+        })
+        .small()
+        .color(MUTED),
+    );
+    ui.label(
+        RichText::new(if format.preserves_all_metadata(&source.info.metadata) {
+            "Metadata: all loaded source metadata retained"
+        } else {
+            "Metadata: EXIF and XMP retained; other data needs confirmation"
+        })
+        .small()
+        .color(MUTED),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Source: {} × {} pixels · {}-bit · never changed",
+            source.width(),
+            source.height(),
+            source.info.bit_depth
+        ))
+        .small()
+        .color(ACCENT_TEXT),
+    );
+}
+
 fn rgb_color(color: [f32; 3]) -> Color32 {
     Color32::from_rgb(
         (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -3540,6 +3668,33 @@ fn browser_matches(entry: &BrowserEntry, filter: &str) -> bool {
             .contains(&filter.to_ascii_lowercase())
 }
 
+fn tab_label(label: &str, dirty: bool) -> String {
+    let label = middle_elide(label, 30);
+    if dirty { format!("{label} •") } else { label }
+}
+
+fn middle_elide(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.into();
+    }
+    if max_chars <= 1 {
+        return "…".chars().take(max_chars).collect();
+    }
+    let remaining = max_chars - 1;
+    let left = remaining.div_ceil(2);
+    let right = remaining - left;
+    let end: String = text
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{}…{end}", text.chars().take(left).collect::<String>())
+}
+
 fn reveal_path(path: &Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open")
@@ -3583,5 +3738,12 @@ mod tests {
         assert!(metadata.overwrite);
         assert!(metadata.allow_metadata_loss);
         assert!(!metadata.allow_bit_depth_reduction);
+    }
+
+    #[test]
+    fn long_tab_labels_keep_the_filename_edges_and_dirty_state() {
+        assert_eq!(middle_elide("short.png", 30), "short.png");
+        assert_eq!(middle_elide("abcdefghij.png", 10), "abcde….png");
+        assert_eq!(tab_label("short.png", true), "short.png •");
     }
 }
