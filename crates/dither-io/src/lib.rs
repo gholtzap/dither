@@ -38,14 +38,31 @@ use rawler::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
     Png16,
+    #[default]
     Tiff16,
     OpenExr32,
 }
 
 impl ExportFormat {
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png16 => "png",
+            Self::Tiff16 => "tif",
+            Self::OpenExr32 => "exr",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Png16 => "PNG 16-bit",
+            Self::Tiff16 => "TIFF 16-bit",
+            Self::OpenExr32 => "OpenEXR 32-bit",
+        }
+    }
+
     pub const fn bit_depth(self) -> u8 {
         match self {
             Self::Png16 | Self::Tiff16 => 16,

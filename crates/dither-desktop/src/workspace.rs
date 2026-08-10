@@ -17,48 +17,12 @@ pub enum BrowserSort {
     FileType,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SavedExportFormat {
-    Png16,
-    #[default]
-    Tiff16,
-    OpenExr32,
-}
-
-impl From<SavedExportFormat> for ExportFormat {
-    fn from(value: SavedExportFormat) -> Self {
-        match value {
-            SavedExportFormat::Png16 => Self::Png16,
-            SavedExportFormat::Tiff16 => Self::Tiff16,
-            SavedExportFormat::OpenExr32 => Self::OpenExr32,
-        }
-    }
-}
-
-impl SavedExportFormat {
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Png16 => "png",
-            Self::Tiff16 => "tif",
-            Self::OpenExr32 => "exr",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Png16 => "PNG 16-bit",
-            Self::Tiff16 => "TIFF 16-bit",
-            Self::OpenExr32 => "OpenEXR 32-bit",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExportSettings {
     pub directory: Option<PathBuf>,
     pub naming: String,
-    pub format: SavedExportFormat,
+    pub format: ExportFormat,
     pub plates: bool,
 }
 
@@ -67,7 +31,7 @@ impl Default for ExportSettings {
         Self {
             directory: None,
             naming: "{name}-dithered".into(),
-            format: SavedExportFormat::Tiff16,
+            format: ExportFormat::Tiff16,
             plates: false,
         }
     }
@@ -279,8 +243,8 @@ mod tests {
             project.export.destination(&project.source).unwrap(),
             PathBuf::from("/exports/print-source.tif")
         );
-        assert_eq!(SavedExportFormat::Png16.label(), "PNG 16-bit");
-        assert_eq!(SavedExportFormat::OpenExr32.label(), "OpenEXR 32-bit");
+        assert_eq!(ExportFormat::Png16.label(), "PNG 16-bit");
+        assert_eq!(ExportFormat::OpenExr32.label(), "OpenEXR 32-bit");
 
         let mut state = PersistentState::default();
         state.remember_file("one.tif".into());

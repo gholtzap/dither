@@ -32,7 +32,6 @@ use muda::{
 use rfd::FileDialog;
 use workspace::{
     BrowserSort, ExportRecord, ExportSettings, PersistentState, ProjectFile, ProjectState,
-    SavedExportFormat,
 };
 
 const PREVIEW_SIZE: NonZeroU32 = NonZeroU32::new(1400).unwrap();
@@ -847,7 +846,7 @@ impl Editor {
         };
         self.run_export(
             destination,
-            self.export_settings.format.into(),
+            self.export_settings.format,
             ExportOptions::default(),
             self.export_settings.plates,
         );
@@ -1374,7 +1373,7 @@ impl Editor {
                         let destination = export.destination(&source_path).ok_or_else(|| {
                             IoError::InvalidImage("source has no output directory".into())
                         })?;
-                        let format: ExportFormat = export.format.into();
+                        let format = export.format;
                         if export.plates {
                             dither_io::export_with_plates(
                                 &document,
@@ -1476,9 +1475,7 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.label(section_label("Dither"));
             if ui.small_button("Reset").clicked() {
-                let defaults = Recipe::default();
-                document.recipe.dither = defaults.dither;
-                document.recipe.resampling = defaults.resampling;
+                reset_dither(&mut document.recipe);
                 changed = true;
             }
         });
@@ -2532,17 +2529,17 @@ impl eframe::App for Editor {
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(
                                                 &mut self.export_settings.format,
-                                                SavedExportFormat::Png16,
+                                                ExportFormat::Png16,
                                                 "PNG 16-bit",
                                             );
                                             ui.selectable_value(
                                                 &mut self.export_settings.format,
-                                                SavedExportFormat::Tiff16,
+                                                ExportFormat::Tiff16,
                                                 "TIFF 16-bit",
                                             );
                                             ui.selectable_value(
                                                 &mut self.export_settings.format,
-                                                SavedExportFormat::OpenExr32,
+                                                ExportFormat::OpenExr32,
                                                 "OpenEXR 32-bit",
                                             );
                                         });
@@ -2554,11 +2551,7 @@ impl eframe::App for Editor {
                                 }
                                 if let Some(document) = &self.document {
                                     ui.add_space(8.0);
-                                    export_details(
-                                        ui,
-                                        document,
-                                        self.export_settings.format.into(),
-                                    );
+                                    export_details(ui, document, self.export_settings.format);
                                     if let Some(destination) = self
                                         .export_settings
                                         .destination(&document.source().info.path)
@@ -3726,6 +3719,13 @@ fn section_label(text: &str) -> RichText {
         .color(PAPER)
 }
 
+fn reset_dither(recipe: &mut Recipe) {
+    let defaults = Recipe::default();
+    recipe.stylize = defaults.stylize;
+    recipe.dither = defaults.dither;
+    recipe.resampling = defaults.resampling;
+}
+
 fn export_details(ui: &mut egui::Ui, document: &Document, format: ExportFormat) {
     let source = document.source();
     let (width, height) = document.output_dimensions();
@@ -3978,5 +3978,17 @@ mod tests {
             matching_preset_name(&preset_recipe("Comic dots").unwrap()),
             Some("Comic dots")
         );
+    }
+
+    #[test]
+    fn dither_reset_clears_stylize_and_sampling_settings() {
+        let mut recipe = Recipe::default();
+        recipe.stylize.effect = StylizeEffect::Ascii;
+        recipe.dither.algorithm = DitherAlgorithm::Atkinson;
+        recipe.resampling = Resampling::Nearest;
+        reset_dither(&mut recipe);
+        assert_eq!(recipe.stylize, Recipe::default().stylize);
+        assert_eq!(recipe.dither, Recipe::default().dither);
+        assert_eq!(recipe.resampling, Recipe::default().resampling);
     }
 }
