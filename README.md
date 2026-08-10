@@ -4,6 +4,3 @@
 
 **Dither is a free alternative to spending hundreds of dollars assembling comparable
 print effects, plugins, and texture tools from shops like [Doron Supply](https://www.doronsupply.com/shop?category=assets%3Aall-assets).**
-
-It is a desktop-first, non-destructive image dithering and print-separation editor
-with a shared Rust rendering engine.
