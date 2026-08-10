@@ -6,7 +6,8 @@ const algorithms = [
   "blue-noise", "modulation", "dot", "line", "cross", "diamond", "clustered-dot",
 ];
 const presets = [
-  "", "None", "Pixelate", "Dither", "ASCII", "Halftone", "CMYK", "Dot Matrix",
+  "", "None", "Pixelate", "Dither", "ASCII", "Dense ASCII", "Amber ASCII",
+  "Halftone", "Comic dots", "Line screen", "CMYK", "Dot Matrix", "Mono dot matrix", "Amber dot matrix",
   "Risograph", "Mosaic", "Bricks", "Pointillism", "Heatmap", "Threshold", "Duotone",
   "Outline", "Posterize", "Classic diffusion", "Newspaper screen", "Dry Xerox", "Modulated bitmap",
   "Retro five-color", "Warm poster", "Dream glow", "CRT waveform", "CRT linear",

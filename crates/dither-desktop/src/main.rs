@@ -1482,6 +1482,12 @@ impl Editor {
                 changed = true;
             }
         });
+        if let Some(recipe) = preset_picker(ui, &document.recipe) {
+            document.recipe = recipe;
+            let _ = load_recipe_assets(document);
+            changed = true;
+        }
+        ui.add_space(8.0);
         changed |= ui
             .checkbox(&mut document.recipe.bypass, "Show original only")
             .changed();
@@ -1494,9 +1500,14 @@ impl Editor {
                 document.recipe.stylize.effect,
                 StylizeEffect::Heatmap | StylizeEffect::Outline
             ) {
+                let label = match document.recipe.stylize.effect {
+                    StylizeEffect::Ascii => "Character size",
+                    StylizeEffect::DotMatrix => "Dot spacing",
+                    _ => "Cell size",
+                };
                 changed |= slider(
                     ui,
-                    "Effect size",
+                    label,
                     &mut document.recipe.stylize.cell_size,
                     4.0..=96.0,
                 );
@@ -1505,39 +1516,45 @@ impl Editor {
                 document.recipe.stylize.effect,
                 StylizeEffect::DotMatrix | StylizeEffect::Pointillism | StylizeEffect::Outline
             ) {
-                changed |= slider(
-                    ui,
-                    "Effect amount",
-                    &mut document.recipe.stylize.amount,
-                    0.0..=2.0,
-                );
+                let label = match document.recipe.stylize.effect {
+                    StylizeEffect::DotMatrix => "Dot size",
+                    StylizeEffect::Outline => "Edge strength",
+                    _ => "Effect amount",
+                };
+                changed |= slider(ui, label, &mut document.recipe.stylize.amount, 0.0..=2.0);
             }
             if document.recipe.stylize.effect == StylizeEffect::Pointillism {
                 changed |= variation(ui, "Effect seed", &mut document.recipe.stylize.seed);
             }
         }
         changed |= algorithm_selector(ui, &mut document.recipe.dither.algorithm);
-        changed |= resampling_selector(ui, &mut document.recipe.resampling);
+        if matches!(
+            document.recipe.dither.algorithm,
+            DitherAlgorithm::Halftone { .. }
+        ) {
+            changed |= slider(
+                ui,
+                "Screen frequency (lpi)",
+                &mut document.recipe.print.lpi,
+                5.0..=300.0,
+            );
+            ui.label(
+                RichText::new("Lower values make larger screen marks.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
         changed |= slider(
             ui,
             "Diffusion strength",
             &mut document.recipe.dither.strength,
             0.0..=1.0,
         );
-        changed |= variation(ui, "Blue-noise seed", &mut document.recipe.dither.seed);
-        control_row(ui, "Preset", |ui| {
-            egui::ComboBox::from_id_salt("recipe-preset")
-                .width(ui.available_width())
-                .selected_text("Choose preset…")
-                .show_ui(ui, |ui| {
-                    for (name, recipe) in built_in_presets() {
-                        if ui.selectable_label(false, *name).clicked() {
-                            document.recipe = recipe.clone();
-                            let _ = load_recipe_assets(document);
-                            changed = true;
-                        }
-                    }
-                });
+        if matches!(document.recipe.dither.algorithm, DitherAlgorithm::BlueNoise) {
+            changed |= variation(ui, "Blue-noise seed", &mut document.recipe.dither.seed);
+        }
+        egui::CollapsingHeader::new("Sampling").show(ui, |ui| {
+            changed |= resampling_selector(ui, &mut document.recipe.resampling);
         });
 
         ui.add_space(18.0);
@@ -2980,6 +2997,128 @@ fn load_recipe_assets(document: &mut Document) -> Vec<String> {
     errors
 }
 
+const ASCII_PRESETS: &[&str] = &["ASCII", "Dense ASCII", "Amber ASCII"];
+const HALFTONE_PRESETS: &[&str] = &["Halftone", "Comic dots", "Line screen", "CMYK print"];
+const DOT_MATRIX_PRESETS: &[&str] = &["Dot Matrix", "Mono dot matrix", "Amber dot matrix"];
+const FAVORITE_PRESETS: &[&str] = &["Dither", "Retro five-color"];
+
+fn preset_picker(ui: &mut egui::Ui, recipe: &Recipe) -> Option<Recipe> {
+    let current = matching_preset_name(recipe);
+    let mut selected = None;
+
+    ui.label(RichText::new("Quick looks").small().color(MUTED));
+    ui.horizontal_wrapped(|ui| {
+        for (name, label) in [
+            ("Dither", "Classic"),
+            ("Retro five-color", "Five color"),
+            ("ASCII", "Ascii"),
+            ("Halftone", "Halftone"),
+            ("Dot Matrix", "Dot matrix"),
+        ] {
+            if ui
+                .add(egui::Button::new(label).selected(current == Some(name)))
+                .clicked()
+            {
+                selected = preset_recipe(name);
+            }
+        }
+    });
+    ui.menu_button("Browse presets", |ui| {
+        preset_submenu(ui, "Favorites", FAVORITE_PRESETS, &mut selected);
+        preset_submenu(ui, "Ascii", ASCII_PRESETS, &mut selected);
+        preset_submenu(ui, "Halftone", HALFTONE_PRESETS, &mut selected);
+        preset_submenu(ui, "Dot matrix", DOT_MATRIX_PRESETS, &mut selected);
+        ui.menu_button("More", |ui| {
+            for (name, recipe) in built_in_presets() {
+                if !is_featured_preset(name)
+                    && ui
+                        .selectable_label(current == Some(*name), preset_label(name))
+                        .clicked()
+                {
+                    selected = Some(recipe.clone());
+                    ui.close();
+                }
+            }
+        });
+    });
+    let (name, description) = current.map_or(
+        (
+            "Custom settings",
+            "Adjust any control to make this look your own.",
+        ),
+        |name| (preset_label(name), preset_description(name)),
+    );
+    ui.label(RichText::new(name).color(PAPER));
+    ui.label(RichText::new(description).small().color(MUTED));
+
+    selected
+}
+
+fn preset_submenu(ui: &mut egui::Ui, label: &str, names: &[&str], selected: &mut Option<Recipe>) {
+    ui.menu_button(label, |ui| {
+        for name in names {
+            if ui.button(preset_label(name)).clicked() {
+                *selected = preset_recipe(name);
+                ui.close();
+            }
+        }
+    });
+}
+
+fn preset_recipe(name: &str) -> Option<Recipe> {
+    built_in_presets()
+        .iter()
+        .find(|(preset, _)| *preset == name)
+        .map(|(_, recipe)| recipe.clone())
+}
+
+fn matching_preset_name(recipe: &Recipe) -> Option<&'static str> {
+    built_in_presets()
+        .iter()
+        .find(|(_, preset)| preset == recipe)
+        .map(|(name, _)| *name)
+}
+
+fn is_featured_preset(name: &str) -> bool {
+    [
+        FAVORITE_PRESETS,
+        ASCII_PRESETS,
+        HALFTONE_PRESETS,
+        DOT_MATRIX_PRESETS,
+    ]
+    .iter()
+    .any(|group| group.contains(&name))
+}
+
+fn preset_label(name: &str) -> &str {
+    match name {
+        "ASCII" => "Ascii",
+        "Dense ASCII" => "Dense ascii",
+        "Amber ASCII" => "Amber ascii",
+        "CMYK" => "Cmyk",
+        "CMYK print" => "Cmyk print",
+        "Dot Matrix" => "Dot matrix",
+        name => name,
+    }
+}
+
+fn preset_description(name: &str) -> &'static str {
+    match name {
+        "Dither" | "Classic diffusion" => "Balanced black-and-white error diffusion.",
+        "Retro five-color" => "A compact game-inspired palette with ordered pixels.",
+        "ASCII" => "Clear glyph shapes with balanced image detail.",
+        "Dense ASCII" => "Smaller characters preserve more fine detail.",
+        "Amber ASCII" => "Large amber glyphs on a dark background.",
+        "Halftone" | "Newspaper screen" => "Clustered ink marks with a newspaper feel.",
+        "Comic dots" => "Large navy dots on warm paper with strong contrast.",
+        "Line screen" => "Parallel ink lines create a graphic print texture.",
+        "Dot Matrix" => "A color grid with dots sized from image tone.",
+        "Mono dot matrix" => "A crisp black dot grid with reduced tones.",
+        "Amber dot matrix" => "A compact amber display grid on a dark field.",
+        _ => "A complete starting look that you can adjust.",
+    }
+}
+
 fn stylize_selector(ui: &mut egui::Ui, effect: &mut StylizeEffect) -> bool {
     let previous = *effect;
     control_row(ui, "Effect", |ui| {
@@ -3009,7 +3148,7 @@ fn stylize_name(effect: StylizeEffect) -> &'static str {
     match effect {
         StylizeEffect::None => "None",
         StylizeEffect::Pixelate => "Pixelate",
-        StylizeEffect::Ascii => "ASCII",
+        StylizeEffect::Ascii => "Ascii",
         StylizeEffect::DotMatrix => "Dot matrix",
         StylizeEffect::Mosaic => "Mosaic",
         StylizeEffect::Bricks => "Bricks",
@@ -3818,5 +3957,26 @@ mod tests {
         assert_eq!(middle_elide("short.png", 30), "short.png");
         assert_eq!(middle_elide("abcdefghij.png", 10), "abcde….png");
         assert_eq!(tab_label("short.png", true), "short.png •");
+    }
+
+    #[test]
+    fn creative_presets_are_featured_with_sentence_case_labels() {
+        for name in [
+            "Dense ASCII",
+            "Amber ASCII",
+            "Comic dots",
+            "Line screen",
+            "Mono dot matrix",
+            "Amber dot matrix",
+        ] {
+            assert!(is_featured_preset(name));
+            assert!(preset_recipe(name).is_some());
+        }
+        assert_eq!(preset_label("Dense ASCII"), "Dense ascii");
+        assert_eq!(preset_label("Dot Matrix"), "Dot matrix");
+        assert_eq!(
+            matching_preset_name(&preset_recipe("Comic dots").unwrap()),
+            Some("Comic dots")
+        );
     }
 }

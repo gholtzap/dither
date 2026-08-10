@@ -43,6 +43,24 @@ test("browser WebAssembly exposes stylize effects and bypass", () => {
   assert.deepEqual(bypassed, input);
 });
 
+test("browser WebAssembly exposes the creative presets", () => {
+  const input = Uint8Array.from({ length: 16 * 16 * 4 }, (_, index) =>
+    index % 4 === 3 ? 255 : (index * 29) % 256,
+  );
+  for (const preset of [
+    "Dense ASCII",
+    "Amber ASCII",
+    "Comic dots",
+    "Line screen",
+    "Mono dot matrix",
+    "Amber dot matrix",
+  ]) {
+    const output = dither_rgba(input, 16, 16, JSON.stringify({ preset }));
+    assert.equal(output.length, input.length);
+    assert.notDeepEqual(output, input, `${preset} did not change the image`);
+  }
+});
+
 test("browser WebAssembly renders full recipes, assets, and plates", () => {
   const input = Uint8Array.from([32, 96, 160, 255, 220, 120, 40, 255]);
   const asset = Uint8Array.from([128, 128, 128, 255]);
