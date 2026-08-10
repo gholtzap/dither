@@ -25,6 +25,24 @@ test("browser WebAssembly renders RGBA with the shared engine", () => {
   assert.equal(output[7], 128);
 });
 
+test("browser WebAssembly exposes stylize effects and bypass", () => {
+  const input = Uint8Array.from([
+    0, 0, 0, 255, 80, 40, 20, 255, 180, 120, 60, 255, 255, 255, 255, 255,
+  ]);
+  const stylized = dither_rgba(
+    input,
+    4,
+    1,
+    JSON.stringify({
+      recipe: { stylize: { effect: "heatmap", cellSize: 4, amount: 1 } },
+    }),
+  );
+  assert.notDeepEqual(stylized, input);
+
+  const bypassed = dither_rgba(input, 4, 1, JSON.stringify({ preset: "None" }));
+  assert.deepEqual(bypassed, input);
+});
+
 test("browser WebAssembly renders full recipes, assets, and plates", () => {
   const input = Uint8Array.from([32, 96, 160, 255, 220, 120, 40, 255]);
   const asset = Uint8Array.from([128, 128, 128, 255]);

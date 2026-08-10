@@ -3,7 +3,8 @@ use std::{num::NonZeroU32, path::PathBuf};
 use dither_core::{
     AssetKind, CrtPhase, DitherAlgorithm, Document, FourColor, HalftoneShape, Ink, MapPattern,
     Metadata, Monochrome, PaletteSettings, Recipe, Resampling, Separation, SourceImage, SourceInfo,
-    Texture, ThreeColor, ToneBand, TriTone, built_in_presets, linear_to_srgb, srgb_to_linear,
+    StylizeEffect, Texture, ThreeColor, ToneBand, TriTone, built_in_presets, linear_to_srgb,
+    srgb_to_linear,
 };
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -36,10 +37,12 @@ struct WebOptions {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct WebRecipe {
+    bypass: Option<bool>,
     separation: Option<WebSeparation>,
     dither: Option<WebDither>,
     resampling: Option<String>,
     preprocess: Option<WebPreprocess>,
+    stylize: Option<WebStylize>,
     print: Option<WebPrint>,
     glow: Option<WebGlow>,
     displacement: Option<WebDisplacement>,
@@ -47,6 +50,15 @@ struct WebRecipe {
     grain: Option<WebTexture>,
     paper: Option<WebTexture>,
     paper_color: Option<[f32; 3]>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct WebStylize {
+    effect: Option<String>,
+    cell_size: Option<f32>,
+    amount: Option<f32>,
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,6 +228,9 @@ enum WebSeparation {
 
 impl WebRecipe {
     fn apply(self, recipe: &mut Recipe) -> Result<(), String> {
+        if let Some(value) = self.bypass {
+            recipe.bypass = value;
+        }
         if let Some(dither) = self.dither {
             if let Some(algorithm) = dither.algorithm {
                 recipe.dither.algorithm = parse_algorithm(&algorithm)?;
@@ -257,6 +272,20 @@ impl WebRecipe {
             }
             if let Some(value) = settings.invert {
                 recipe.preprocess.invert = value;
+            }
+        }
+        if let Some(settings) = self.stylize {
+            if let Some(value) = settings.effect {
+                recipe.stylize.effect = parse_stylize_effect(&value)?;
+            }
+            if let Some(value) = settings.cell_size {
+                recipe.stylize.cell_size = value;
+            }
+            if let Some(value) = settings.amount {
+                recipe.stylize.amount = value;
+            }
+            if let Some(value) = settings.seed {
+                recipe.stylize.seed = value;
             }
         }
         if let Some(settings) = self.print {
@@ -928,6 +957,8 @@ fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
         return Err("preprocess.blackPoint must be below whitePoint".into());
     }
     validate_bounded("preprocess.denoise", recipe.preprocess.denoise, 0.0, 1.0)?;
+    validate_bounded("stylize.cellSize", recipe.stylize.cell_size, 4.0, 256.0)?;
+    validate_bounded("stylize.amount", recipe.stylize.amount, 0.0, 2.0)?;
 
     match &recipe.separation {
         Separation::Monochrome(settings) => {
@@ -1106,6 +1137,21 @@ fn parse_resampling(value: &str) -> Result<Resampling, String> {
     }
 }
 
+fn parse_stylize_effect(value: &str) -> Result<StylizeEffect, String> {
+    match normalize_name(value).as_str() {
+        "none" => Ok(StylizeEffect::None),
+        "pixelate" => Ok(StylizeEffect::Pixelate),
+        "ascii" => Ok(StylizeEffect::Ascii),
+        "dot-matrix" | "dotmatrix" => Ok(StylizeEffect::DotMatrix),
+        "mosaic" => Ok(StylizeEffect::Mosaic),
+        "bricks" => Ok(StylizeEffect::Bricks),
+        "pointillism" => Ok(StylizeEffect::Pointillism),
+        "heatmap" => Ok(StylizeEffect::Heatmap),
+        "outline" => Ok(StylizeEffect::Outline),
+        _ => Err(format!("unsupported effect: {value}")),
+    }
+}
+
 fn parse_map_pattern(value: &str) -> Result<MapPattern, String> {
     match normalize_name(value).as_str() {
         "imported" => Ok(MapPattern::Imported),
@@ -1225,5 +1271,32 @@ mod tests {
         assert_eq!(output.plate_coverages.len(), 4 * 2);
         assert!(output.plate_metadata_json.contains("magenta"));
         assert!(render(&input, 2, 1, r#"{"recipe":{"print":{"dpi":0}}}"#).is_err());
+    }
+
+    #[test]
+    fn exposes_stylize_settings_and_the_bypass_preset() {
+        let input = [32, 96, 160, 255, 220, 120, 40, 255];
+        let bypass = render(&input, 2, 1, r#"{"preset":"None"}"#).unwrap();
+        assert_eq!(bypass.composite_rgba, input);
+        assert!(bypass.plate_coverages.is_empty());
+
+        assert!(
+            render(
+                &input,
+                2,
+                1,
+                r#"{"recipe":{"stylize":{"effect":"pixelate","cellSize":4,"amount":1}}}"#,
+            )
+            .is_ok()
+        );
+        assert!(
+            render(
+                &input,
+                2,
+                1,
+                r#"{"recipe":{"stylize":{"effect":"unknown"}}}"#,
+            )
+            .is_err()
+        );
     }
 }

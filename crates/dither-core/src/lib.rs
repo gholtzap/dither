@@ -224,6 +224,40 @@ pub enum Resampling {
     Supersample2x,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StylizeEffect {
+    #[default]
+    None,
+    Pixelate,
+    Ascii,
+    DotMatrix,
+    Mosaic,
+    Bricks,
+    Pointillism,
+    Heatmap,
+    Outline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StylizeSettings {
+    pub effect: StylizeEffect,
+    pub cell_size: f32,
+    pub amount: f32,
+    pub seed: u64,
+}
+
+impl Default for StylizeSettings {
+    fn default() -> Self {
+        Self {
+            effect: StylizeEffect::None,
+            cell_size: 12.0,
+            amount: 1.0,
+            seed: 23,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Transform {
@@ -605,11 +639,13 @@ pub struct AssetPaths {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Recipe {
+    pub bypass: bool,
     pub separation: Separation,
     pub dither: DitherSettings,
     pub resampling: Resampling,
     pub transform: Transform,
     pub preprocess: Preprocess,
+    pub stylize: StylizeSettings,
     pub print: PrintSettings,
     pub glow: Glow,
     pub displacement: Displacement,
@@ -623,11 +659,13 @@ pub struct Recipe {
 impl Default for Recipe {
     fn default() -> Self {
         Self {
+            bypass: false,
             separation: Separation::default(),
             dither: DitherSettings::default(),
             resampling: Resampling::default(),
             transform: Transform::default(),
             preprocess: Preprocess::default(),
+            stylize: StylizeSettings::default(),
             print: PrintSettings::default(),
             glow: Glow::default(),
             displacement: Displacement::default(),
@@ -723,7 +761,104 @@ pub fn built_in_presets() -> &'static [(&'static str, Recipe)] {
         };
         cmyk.print.lpi = 45.0;
 
+        let none = Recipe {
+            bypass: true,
+            ..Recipe::default()
+        };
+
+        let indexed_style = |effect| Recipe {
+            separation: Separation::Indexed(PaletteSettings {
+                colors: Vec::new(),
+                inks: Vec::new(),
+                size: 16,
+            }),
+            dither: DitherSettings {
+                strength: 0.0,
+                ..DitherSettings::default()
+            },
+            stylize: StylizeSettings {
+                effect,
+                ..StylizeSettings::default()
+            },
+            ..Recipe::default()
+        };
+
+        let mut ascii = Recipe::default();
+        ascii.stylize.effect = StylizeEffect::Ascii;
+        ascii.dither.strength = 0.0;
+
+        let mut threshold = Recipe::default();
+        threshold.dither.strength = 0.0;
+        if let Separation::Monochrome(settings) = &mut threshold.separation {
+            settings.softness = 0.01;
+        }
+
+        let mut duotone = Recipe {
+            separation: Separation::Tonal(preset_palette(&[
+                [0.03, 0.05, 0.16],
+                [0.95, 0.32, 0.22],
+            ])),
+            ..Recipe::default()
+        };
+        duotone.dither.algorithm = DitherAlgorithm::BlueNoise;
+
+        let mut heatmap = indexed_style(StylizeEffect::Heatmap);
+        heatmap.separation = Separation::Custom(preset_palette(&[
+            [0.02, 0.01, 0.18],
+            [0.02, 0.22, 0.88],
+            [0.0, 0.85, 0.78],
+            [0.96, 0.92, 0.02],
+            [0.95, 0.06, 0.02],
+        ]));
+
+        let mut outline = Recipe::default();
+        outline.stylize.effect = StylizeEffect::Outline;
+        outline.stylize.amount = 1.4;
+        outline.dither.strength = 0.0;
+
+        let mut risograph = Recipe {
+            separation: Separation::Custom(preset_palette(&[
+                [0.04, 0.10, 0.24],
+                [0.95, 0.18, 0.08],
+                [0.96, 0.78, 0.18],
+            ])),
+            ..Recipe::default()
+        };
+        if let Separation::Custom(settings) = &mut risograph.separation {
+            settings.inks[0].offset = [-1, 0];
+            settings.inks[1].offset = [1, 0];
+            settings.inks[2].offset = [0, 1];
+        }
+        risograph.dither.algorithm = DitherAlgorithm::Halftone {
+            shape: HalftoneShape::ClusteredDot,
+        };
+        risograph.grain.amount = 0.2;
+        risograph.paper.amount = 0.16;
+
+        let mut posterize = indexed_style(StylizeEffect::None);
+        posterize.separation = Separation::Indexed(PaletteSettings {
+            colors: Vec::new(),
+            inks: Vec::new(),
+            size: 6,
+        });
+
         vec![
+            ("None", none),
+            ("Pixelate", indexed_style(StylizeEffect::Pixelate)),
+            ("Dither", classic.clone()),
+            ("ASCII", ascii),
+            ("Halftone", newspaper.clone()),
+            ("CMYK", cmyk.clone()),
+            ("Dot Matrix", indexed_style(StylizeEffect::DotMatrix)),
+            ("Risograph", risograph),
+            ("Mosaic", indexed_style(StylizeEffect::Mosaic)),
+            ("Bricks", indexed_style(StylizeEffect::Bricks)),
+            ("Pointillism", indexed_style(StylizeEffect::Pointillism)),
+            ("Heatmap", heatmap),
+            ("Threshold", threshold),
+            ("Duotone", duotone),
+            ("Outline", outline),
+            ("Posterize", posterize),
             ("Classic diffusion", classic),
             ("Newspaper screen", newspaper),
             ("Dry Xerox", xerox),
@@ -809,6 +944,9 @@ impl Document {
     }
 
     pub fn plate_names(&self) -> Vec<String> {
+        if self.recipe.bypass {
+            return Vec::new();
+        }
         match &self.recipe.separation {
             Separation::Monochrome(settings) => settings
                 .ink
@@ -925,9 +1063,27 @@ impl Document {
         let scale =
             (width as f32 / full_width.get() as f32).min(height as f32 / full_height.get() as f32);
         let mut pixels = self.resample_effects(width, height, scale);
+        if self.recipe.bypass {
+            return RenderedDocument {
+                composite: RenderedImage::new(output_width, output_height, pixels),
+                plates: Vec::new(),
+            };
+        }
         let mut preprocess_settings = self.recipe.preprocess;
         preprocess_settings.blur_radius *= scale;
         preprocess(&mut pixels, width, height, preprocess_settings);
+        if self.recipe.stylize.effect != StylizeEffect::None {
+            let mut work = pixels.clone();
+            let _ = apply_stylize(
+                &mut pixels,
+                &mut work,
+                width,
+                height,
+                self.recipe.stylize,
+                scale,
+                None,
+            );
+        }
         let mut glow = self.recipe.glow;
         glow.radius *= scale;
         apply_glow(&mut pixels, width, height, glow);
@@ -985,7 +1141,8 @@ impl Document {
                 (0..width).map(move |x| {
                     let mut ox = 0.0;
                     let mut oy = 0.0;
-                    if self.recipe.displacement.enabled
+                    if !self.recipe.bypass
+                        && self.recipe.displacement.enabled
                         && let Some(sample) = displacement_sample(
                             self.assets.displacement_map.as_deref(),
                             x,
@@ -999,7 +1156,7 @@ impl Document {
                         ox += (sample[0] * 2.0 - 1.0) * self.recipe.displacement.x_strength * scale;
                         oy += (sample[1] * 2.0 - 1.0) * self.recipe.displacement.y_strength * scale;
                     }
-                    if self.recipe.crt.enabled {
+                    if !self.recipe.bypass && self.recipe.crt.enabled {
                         let phase = y as f32 / height.max(1) as f32
                             * self.recipe.crt.wave_frequency
                             * std::f32::consts::TAU;
@@ -1037,7 +1194,10 @@ impl Document {
                         height,
                         self.recipe.resampling,
                     );
-                    if self.recipe.crt.enabled && self.recipe.crt.rgb_bleed > 0.0 {
+                    if !self.recipe.bypass
+                        && self.recipe.crt.enabled
+                        && self.recipe.crt.rgb_bleed > 0.0
+                    {
                         let bleed = self.recipe.crt.rgb_bleed * scale;
                         pixel[0] = self.sample_transformed(
                             x as f32 + ox + bleed,
@@ -1672,6 +1832,297 @@ fn preprocess(pixels: &mut [Pixel], width: usize, height: usize, settings: Prepr
             *channel = value.max(0.0);
         }
     }
+}
+
+fn apply_stylize(
+    pixels: &mut [Pixel],
+    work: &mut [Pixel],
+    width: usize,
+    height: usize,
+    settings: StylizeSettings,
+    scale: f32,
+    cancel: Option<&AtomicBool>,
+) -> bool {
+    if settings.effect == StylizeEffect::None || pixels.is_empty() {
+        return true;
+    }
+    work[..pixels.len()].copy_from_slice(pixels);
+    let source = &work[..pixels.len()];
+    let cell = (settings.cell_size * scale)
+        .round()
+        .clamp(2.0, width.max(height).max(2) as f32) as usize;
+    let amount = settings.amount.clamp(0.0, 2.0);
+
+    match settings.effect {
+        StylizeEffect::None => {}
+        StylizeEffect::Heatmap => {
+            for (y, (output, input)) in pixels
+                .chunks_mut(width)
+                .zip(source.chunks(width))
+                .enumerate()
+            {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
+                for (output, input) in output.iter_mut().zip(input) {
+                    let color = heatmap_color(luminance(*input));
+                    output[..3].copy_from_slice(&color);
+                    output[3] = input[3];
+                }
+            }
+        }
+        StylizeEffect::Outline => {
+            for y in 0..height {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
+                for x in 0..width {
+                    let sample = |dx: i32, dy: i32| {
+                        let px = (x as i32 + dx).clamp(0, width as i32 - 1) as usize;
+                        let py = (y as i32 + dy).clamp(0, height as i32 - 1) as usize;
+                        luminance(source[py * width + px])
+                    };
+                    let gx = -sample(-1, -1) + sample(1, -1) - 2.0 * sample(-1, 0)
+                        + 2.0 * sample(1, 0)
+                        - sample(-1, 1)
+                        + sample(1, 1);
+                    let gy = -sample(-1, -1) - 2.0 * sample(0, -1) - sample(1, -1)
+                        + sample(-1, 1)
+                        + 2.0 * sample(0, 1)
+                        + sample(1, 1);
+                    let value = 1.0 - (gx.hypot(gy) * amount).clamp(0.0, 1.0);
+                    pixels[y * width + x] = [value, value, value, source[y * width + x][3]];
+                }
+            }
+        }
+        StylizeEffect::Pixelate => {
+            for top in (0..height).step_by(cell) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return false;
+                }
+                for left in (0..width).step_by(cell) {
+                    let right = (left + cell).min(width);
+                    let bottom = (top + cell).min(height);
+                    let color = source[((top + bottom - 1) / 2) * width + (left + right - 1) / 2];
+                    fill_rect(pixels, source, width, left, top, right, bottom, color, 0);
+                }
+            }
+        }
+        StylizeEffect::Mosaic => {
+            let border = ((scale * 1.5).round() as usize).max(1).min(cell / 3);
+            for top in (0..height).step_by(cell) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return false;
+                }
+                for left in (0..width).step_by(cell) {
+                    let right = (left + cell).min(width);
+                    let bottom = (top + cell).min(height);
+                    let color = average_rect(source, width, left, top, right, bottom);
+                    fill_rect(
+                        pixels, source, width, left, top, right, bottom, color, border,
+                    );
+                }
+            }
+        }
+        StylizeEffect::Bricks => {
+            pixels.copy_from_slice(source);
+            let brick_height = cell;
+            let brick_width = cell.saturating_mul(2);
+            let mortar = ((scale * 1.5).round() as usize).max(1).min(cell / 3);
+            for (row, top) in (0..height).step_by(brick_height).enumerate() {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return false;
+                }
+                let offset = if row % 2 == 0 { 0 } else { brick_width / 2 };
+                let mut left = -(offset as isize);
+                while left < width as isize {
+                    let clipped_left = left.max(0) as usize;
+                    let right = (left + brick_width as isize).clamp(0, width as isize) as usize;
+                    let bottom = (top + brick_height).min(height);
+                    if clipped_left < right {
+                        let color = average_rect(source, width, clipped_left, top, right, bottom);
+                        fill_rect(
+                            pixels,
+                            source,
+                            width,
+                            clipped_left,
+                            top,
+                            right,
+                            bottom,
+                            color,
+                            mortar,
+                        );
+                    }
+                    left += brick_width as isize;
+                }
+            }
+        }
+        StylizeEffect::DotMatrix | StylizeEffect::Pointillism => {
+            for (y, (output, input)) in pixels
+                .chunks_mut(width)
+                .zip(source.chunks(width))
+                .enumerate()
+            {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
+                for (output, input) in output.iter_mut().zip(input) {
+                    *output = [1.0, 1.0, 1.0, input[3]];
+                }
+            }
+            for top in (0..height).step_by(cell) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return false;
+                }
+                for left in (0..width).step_by(cell) {
+                    let right = (left + cell).min(width);
+                    let bottom = (top + cell).min(height);
+                    let color = average_rect(source, width, left, top, right, bottom);
+                    let darkness = (1.0 - luminance(color)).clamp(0.0, 1.0);
+                    let (cx, cy, radius) = if settings.effect == StylizeEffect::Pointillism {
+                        let jitter_x = random(left as i32, top as i32, settings.seed) * 0.24;
+                        let jitter_y =
+                            random(top as i32, left as i32, settings.seed.wrapping_add(1)) * 0.24;
+                        (
+                            left as f32 + cell as f32 * (0.5 + jitter_x),
+                            top as f32 + cell as f32 * (0.5 + jitter_y),
+                            cell as f32 * (0.16 + darkness * 0.34) * amount,
+                        )
+                    } else {
+                        (
+                            (left + right) as f32 * 0.5,
+                            (top + bottom) as f32 * 0.5,
+                            cell as f32 * (0.12 + darkness * 0.34) * amount,
+                        )
+                    };
+                    let radius_squared = radius * radius;
+                    for y in top..bottom {
+                        for x in left..right {
+                            if (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)
+                                <= radius_squared
+                            {
+                                let index = y * width + x;
+                                pixels[index][..3].copy_from_slice(&color[..3]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        StylizeEffect::Ascii => {
+            const GLYPHS: [[u8; 7]; 10] = [
+                [0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0b00100, 0],
+                [0, 0b00100, 0, 0, 0b00100, 0, 0],
+                [0, 0, 0, 0b11111, 0, 0, 0],
+                [0, 0, 0b11111, 0, 0b11111, 0, 0],
+                [0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0],
+                [0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0],
+                [0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0, 0],
+                [0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0],
+                [
+                    0b01110, 0b10001, 0b10111, 0b10101, 0b10111, 0b10000, 0b01110,
+                ],
+            ];
+            for (y, (output, input)) in pixels
+                .chunks_mut(width)
+                .zip(source.chunks(width))
+                .enumerate()
+            {
+                if render_cancelled(cancel, y) {
+                    return false;
+                }
+                for (output, input) in output.iter_mut().zip(input) {
+                    *output = [1.0, 1.0, 1.0, input[3]];
+                }
+            }
+            let cell_width = ((cell as f32 * 0.72).round() as usize).max(5);
+            for top in (0..height).step_by(cell) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return false;
+                }
+                for left in (0..width).step_by(cell_width) {
+                    let right = (left + cell_width).min(width);
+                    let bottom = (top + cell).min(height);
+                    let tone = luminance(average_rect(source, width, left, top, right, bottom));
+                    let glyph = GLYPHS[((1.0 - tone) * 9.0).round() as usize];
+                    for y in top..bottom {
+                        let gy = ((y - top) * 7 / (bottom - top).max(1)).min(6);
+                        for x in left..right {
+                            let gx = ((x - left) * 5 / (right - left).max(1)).min(4);
+                            if glyph[gy] & (1 << (4 - gx)) != 0 {
+                                pixels[y * width + x][..3].fill(0.02);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn average_rect(
+    pixels: &[Pixel],
+    width: usize,
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+) -> Pixel {
+    let mut average = [0.0; 4];
+    let count = ((right - left) * (bottom - top)).max(1) as f32;
+    for row in pixels[top * width..bottom * width].chunks(width) {
+        for pixel in &row[left..right] {
+            for channel in 0..4 {
+                average[channel] += pixel[channel] / count;
+            }
+        }
+    }
+    average
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_rect(
+    output: &mut [Pixel],
+    source: &[Pixel],
+    width: usize,
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    color: Pixel,
+    border: usize,
+) {
+    for y in top..bottom {
+        for x in left..right {
+            let index = y * width + x;
+            let edge = x < left + border
+                || x + border >= right
+                || y < top + border
+                || y + border >= bottom;
+            output[index] = if edge {
+                [0.92, 0.92, 0.92, source[index][3]]
+            } else {
+                [color[0], color[1], color[2], source[index][3]]
+            };
+        }
+    }
+}
+
+fn heatmap_color(value: f32) -> [f32; 3] {
+    const STOPS: [[f32; 3]; 5] = [
+        [0.02, 0.01, 0.18],
+        [0.02, 0.22, 0.88],
+        [0.0, 0.85, 0.78],
+        [0.96, 0.92, 0.02],
+        [0.95, 0.06, 0.02],
+    ];
+    let position = value.clamp(0.0, 1.0) * (STOPS.len() - 1) as f32;
+    let index = position.floor() as usize;
+    let next = (index + 1).min(STOPS.len() - 1);
+    let mix = position - index as f32;
+    std::array::from_fn(|channel| STOPS[index][channel] * (1.0 - mix) + STOPS[next][channel] * mix)
 }
 
 fn median_filter(pixels: &[Pixel], width: usize, height: usize) -> Vec<Pixel> {
@@ -2593,6 +3044,84 @@ mod tests {
     }
 
     #[test]
+    fn stylize_effects_are_distinct_deterministic_and_non_destructive() {
+        let image = source();
+        let original = image.pixels().to_vec();
+        for effect in [
+            StylizeEffect::Pixelate,
+            StylizeEffect::Ascii,
+            StylizeEffect::DotMatrix,
+            StylizeEffect::Mosaic,
+            StylizeEffect::Bricks,
+            StylizeEffect::Pointillism,
+            StylizeEffect::Heatmap,
+            StylizeEffect::Outline,
+        ] {
+            let settings = StylizeSettings {
+                effect,
+                cell_size: 4.0,
+                ..StylizeSettings::default()
+            };
+            let mut first = original.clone();
+            let mut first_work = first.clone();
+            assert!(apply_stylize(
+                &mut first,
+                &mut first_work,
+                8,
+                4,
+                settings,
+                1.0,
+                None,
+            ));
+            let mut second = original.clone();
+            let mut second_work = second.clone();
+            assert!(apply_stylize(
+                &mut second,
+                &mut second_work,
+                8,
+                4,
+                settings,
+                1.0,
+                None,
+            ));
+            assert_ne!(first, original, "{effect:?} did not change the image");
+            assert_eq!(first, second, "{effect:?} was not deterministic");
+            assert_eq!(image.pixels(), original);
+        }
+    }
+
+    #[test]
+    fn stylize_effects_honor_render_cancellation() {
+        let mut pixels = source().pixels().to_vec();
+        let mut work = pixels.clone();
+        assert!(!apply_stylize(
+            &mut pixels,
+            &mut work,
+            8,
+            4,
+            StylizeSettings {
+                effect: StylizeEffect::Outline,
+                ..StylizeSettings::default()
+            },
+            1.0,
+            Some(&AtomicBool::new(true)),
+        ));
+    }
+
+    #[test]
+    fn bypass_returns_the_transformed_source_without_plates() {
+        let mut document = Document::new(source());
+        document.recipe.bypass = true;
+        document.recipe.preprocess.invert = true;
+        document.recipe.stylize.effect = StylizeEffect::Heatmap;
+        document.recipe.glow.enabled = true;
+        let rendered = document.render_document();
+        assert_eq!(rendered.composite.pixels(), document.source().pixels());
+        assert!(rendered.plates.is_empty());
+        assert!(document.plate_names().is_empty());
+    }
+
+    #[test]
     fn new_sampling_glow_maps_and_presets_are_effective_and_deterministic() {
         let image = source();
         assert_ne!(
@@ -2614,7 +3143,29 @@ mod tests {
         let glow = power_blur(&pixels, 5, 5, 3.0, 2.0);
         assert!(glow[11][0] > 0.0);
         assert!(glow[12][0] > glow[0][0]);
-        assert!(built_in_presets().len() >= 10);
+        for name in [
+            "None",
+            "Pixelate",
+            "Dither",
+            "ASCII",
+            "Halftone",
+            "CMYK",
+            "Dot Matrix",
+            "Risograph",
+            "Mosaic",
+            "Bricks",
+            "Pointillism",
+            "Heatmap",
+            "Threshold",
+            "Duotone",
+            "Outline",
+            "Posterize",
+        ] {
+            assert!(
+                built_in_presets().iter().any(|(preset, _)| *preset == name),
+                "missing preset: {name}"
+            );
+        }
     }
 
     #[test]
