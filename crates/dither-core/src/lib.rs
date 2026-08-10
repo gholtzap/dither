@@ -787,6 +787,55 @@ pub fn built_in_presets() -> &'static [(&'static str, Recipe)] {
         ascii.stylize.effect = StylizeEffect::Ascii;
         ascii.dither.strength = 0.0;
 
+        let mut dense_ascii = ascii.clone();
+        dense_ascii.stylize.cell_size = 7.0;
+        dense_ascii.preprocess.contrast = 1.18;
+        dense_ascii.resampling = Resampling::Nearest;
+
+        let mut amber_ascii = ascii.clone();
+        amber_ascii.stylize.cell_size = 14.0;
+        amber_ascii.paper_color = [0.015, 0.012, 0.008];
+        amber_ascii.separation = Separation::Monochrome(Monochrome {
+            ink: Ink::new([1.0, 0.42, 0.04], [0, 0], 45.0),
+            threshold: 0.5,
+            softness: 0.34,
+        });
+
+        let mut comic_dots = Recipe::default();
+        comic_dots.dither.algorithm = DitherAlgorithm::Halftone {
+            shape: HalftoneShape::Dot,
+        };
+        comic_dots.print.lpi = 28.0;
+        comic_dots.preprocess.contrast = 1.35;
+        comic_dots.paper_color = [0.98, 0.93, 0.78];
+        if let Separation::Monochrome(settings) = &mut comic_dots.separation {
+            settings.ink.color = [0.02, 0.08, 0.2];
+            settings.softness = 0.32;
+        }
+
+        let mut line_screen = Recipe::default();
+        line_screen.dither.algorithm = DitherAlgorithm::Halftone {
+            shape: HalftoneShape::Line,
+        };
+        line_screen.print.lpi = 38.0;
+        line_screen.preprocess.contrast = 1.12;
+
+        let mut mono_dot_matrix = indexed_style(StylizeEffect::DotMatrix);
+        mono_dot_matrix.stylize.cell_size = 10.0;
+        mono_dot_matrix.stylize.amount = 1.15;
+        mono_dot_matrix.separation = Separation::Monochrome(Monochrome {
+            softness: 0.28,
+            ..Monochrome::default()
+        });
+
+        let mut amber_dot_matrix = mono_dot_matrix.clone();
+        amber_dot_matrix.stylize.cell_size = 9.0;
+        amber_dot_matrix.stylize.amount = 0.92;
+        amber_dot_matrix.paper_color = [0.012, 0.015, 0.01];
+        if let Separation::Monochrome(settings) = &mut amber_dot_matrix.separation {
+            settings.ink.color = [1.0, 0.32, 0.03];
+        }
+
         let mut threshold = Recipe::default();
         threshold.dither.strength = 0.0;
         if let Separation::Monochrome(settings) = &mut threshold.separation {
@@ -847,9 +896,15 @@ pub fn built_in_presets() -> &'static [(&'static str, Recipe)] {
             ("Pixelate", indexed_style(StylizeEffect::Pixelate)),
             ("Dither", classic.clone()),
             ("ASCII", ascii),
+            ("Dense ASCII", dense_ascii),
+            ("Amber ASCII", amber_ascii),
             ("Halftone", newspaper.clone()),
+            ("Comic dots", comic_dots),
+            ("Line screen", line_screen),
             ("CMYK", cmyk.clone()),
             ("Dot Matrix", indexed_style(StylizeEffect::DotMatrix)),
+            ("Mono dot matrix", mono_dot_matrix),
+            ("Amber dot matrix", amber_dot_matrix),
             ("Risograph", risograph),
             ("Mosaic", indexed_style(StylizeEffect::Mosaic)),
             ("Bricks", indexed_style(StylizeEffect::Bricks)),
@@ -3148,9 +3203,15 @@ mod tests {
             "Pixelate",
             "Dither",
             "ASCII",
+            "Dense ASCII",
+            "Amber ASCII",
             "Halftone",
+            "Comic dots",
+            "Line screen",
             "CMYK",
             "Dot Matrix",
+            "Mono dot matrix",
+            "Amber dot matrix",
             "Risograph",
             "Mosaic",
             "Bricks",
@@ -3166,6 +3227,28 @@ mod tests {
                 "missing preset: {name}"
             );
         }
+    }
+
+    #[test]
+    fn creative_presets_expose_distinct_adjustable_starting_points() {
+        let preset = |name| {
+            &built_in_presets()
+                .iter()
+                .find(|(preset, _)| *preset == name)
+                .unwrap()
+                .1
+        };
+        assert_eq!(preset("Dense ASCII").stylize.cell_size, 7.0);
+        assert_eq!(preset("Amber ASCII").paper_color, [0.015, 0.012, 0.008]);
+        assert_eq!(preset("Comic dots").print.lpi, 28.0);
+        assert_eq!(
+            preset("Line screen").dither.algorithm,
+            DitherAlgorithm::Halftone {
+                shape: HalftoneShape::Line
+            }
+        );
+        assert_eq!(preset("Mono dot matrix").stylize.amount, 1.15);
+        assert_eq!(preset("Amber dot matrix").stylize.cell_size, 9.0);
     }
 
     #[test]
