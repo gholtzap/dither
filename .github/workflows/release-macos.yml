@@ -34,7 +34,10 @@ jobs:
 
       - name: Package application
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
           app="dist/Dither.app"
           mkdir -p "$app/Contents/MacOS"
           lipo -create \
