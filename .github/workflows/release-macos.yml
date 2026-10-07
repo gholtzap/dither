@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,7 +15,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'mini-macos' || 'macos-15' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -59,7 +60,15 @@ jobs:
           cd dist
           shasum -a 256 Dither-macOS-universal.zip > SHA256SUMS.txt
 
+      - name: Save the build archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: Dither-macOS-universal
+          path: dist/
+          if-no-files-found: error
+
       - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
