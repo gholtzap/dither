@@ -20,6 +20,11 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Clean the source workspace
+        run: git clean -ffdx -e target/
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
