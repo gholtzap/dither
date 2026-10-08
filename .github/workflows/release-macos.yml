@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'mini-macos' || 'macos-15' }}
+    runs-on: ${{ vars.CI_RUNNER_PROVIDER == 'mini' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'mini-macos' || 'macos-15' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
