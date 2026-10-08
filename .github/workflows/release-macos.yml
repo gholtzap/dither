@@ -20,6 +20,11 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Clean the source workspace
+        run: git clean -ffdx -e target/
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -58,7 +63,8 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app/Contents/Info.plist"
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          lipo "$app/Contents/MacOS/Dither" -verify_arch arm64 x86_64
+          lipo "$app/Contents/MacOS/Dither" -verify_arch arm64
+          lipo "$app/Contents/MacOS/Dither" -verify_arch x86_64
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/Dither-macOS-universal.zip
           cd dist
           shasum -a 256 Dither-macOS-universal.zip > SHA256SUMS.txt
